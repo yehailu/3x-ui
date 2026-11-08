@@ -9,7 +9,9 @@ import {
   SafetyCertificateOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
+import { selectTagRender } from '@/components/form';
 import type { AllSetting } from '@/models/setting';
+import { isOutboundProtocol } from '@/schemas/primitives';
 import { HttpUtil, LanguageManager } from '@/utils';
 import { onNumber } from '@/utils/onNumber';
 import { DefaultSettingTag, SettingListItem } from '@/components/ui';
@@ -86,7 +88,7 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         for (const o of outbounds) {
           if (!o || typeof o !== 'object') continue;
           const rec = o as Record<string, unknown>;
-          if (rec.protocol === 'blackhole') continue; // dropping traffic is never a useful egress
+          if (isOutboundProtocol(rec, 'blackhole')) continue; // never a useful egress
           const tag = rec.tag;
           if (typeof tag === 'string' && tag) tags.add(tag);
         }
@@ -179,7 +181,11 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
       items={[
         {
           key: '1',
-          label: catTabLabel(<SettingOutlined />, t('pages.settings.panelSettings'), isMobile),
+          label: catTabLabel(
+            <SettingOutlined aria-hidden />,
+            t('pages.settings.panelSettings'),
+            isMobile,
+          ),
           children: (
             <>
               <SettingListItem
@@ -261,6 +267,25 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
 
               <SettingListItem
                 paddings="small"
+                title={t('pages.settings.realityScanCandidates')}
+                description={t('pages.settings.realityScanCandidatesDesc')}
+                badge={
+                  <DefaultSettingTag
+                    settingKey="realityScanCandidates"
+                    value={allSetting.realityScanCandidates}
+                  />
+                }
+              >
+                <Input.TextArea
+                  rows={3}
+                  value={allSetting.realityScanCandidates}
+                  placeholder="www.cloudflare.com:443,www.microsoft.com:443"
+                  onChange={(e) => updateSetting({ realityScanCandidates: e.target.value })}
+                />
+              </SettingListItem>
+
+              <SettingListItem
+                paddings="small"
                 title={t('pages.settings.ipLimitAllowlist')}
                 description={t('pages.settings.ipLimitAllowlistDesc')}
               >
@@ -329,7 +354,11 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         },
         {
           key: '2',
-          label: catTabLabel(<BellOutlined />, t('pages.settings.notifications'), isMobile),
+          label: catTabLabel(
+            <BellOutlined aria-hidden />,
+            t('pages.settings.notifications'),
+            isMobile,
+          ),
           children: (
             <>
               <SettingListItem
@@ -366,7 +395,11 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         },
         {
           key: '3',
-          label: catTabLabel(<SafetyCertificateOutlined />, t('pages.settings.certs'), isMobile),
+          label: catTabLabel(
+            <SafetyCertificateOutlined aria-hidden />,
+            t('pages.settings.certs'),
+            isMobile,
+          ),
           children: (
             <>
               <SettingListItem
@@ -394,7 +427,11 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         },
         {
           key: '4',
-          label: catTabLabel(<GlobalOutlined />, t('pages.settings.externalTraffic'), isMobile),
+          label: catTabLabel(
+            <GlobalOutlined aria-hidden />,
+            t('pages.settings.externalTraffic'),
+            isMobile,
+          ),
           children: (
             <>
               <SettingListItem
@@ -423,7 +460,11 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         },
         {
           key: '5',
-          label: catTabLabel(<ClockCircleOutlined />, t('pages.settings.dateAndTime'), isMobile),
+          label: catTabLabel(
+            <ClockCircleOutlined aria-hidden />,
+            t('pages.settings.dateAndTime'),
+            isMobile,
+          ),
           children: (
             <>
               <SettingListItem
@@ -456,7 +497,7 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
         },
         {
           key: '6',
-          label: catTabLabel(<ApartmentOutlined />, 'LDAP', isMobile),
+          label: catTabLabel(<ApartmentOutlined aria-hidden />, 'LDAP', isMobile),
           children: (
             <>
               <SettingListItem paddings="small" title={t('pages.settings.ldap.enable')}>
@@ -597,6 +638,7 @@ export default function GeneralTab({ allSetting, updateSetting }: GeneralTabProp
                 <>
                   <Select
                     mode="multiple"
+                    tagRender={selectTagRender}
                     value={ldapInboundTagList}
                     onChange={setLdapInboundTagList}
                     style={{ width: '100%' }}

@@ -33,6 +33,31 @@ func randInt(min, max int) int {
 	return min + int(n.Int64())
 }
 
+// DefaultMTU is WireGuard/AmneziaWG's usual tunnel MTU on a 1500-byte host
+// link, before AmneziaWG's own S4 transport junk is prepended.
+const DefaultMTU = 1420
+
+// MaxMTU bounds the tunnel MTU: amneziawg-go keeps it as an int32, and a wider value wraps.
+const MaxMTU = 65535
+
+// ValidateMTU refuses an MTU past MaxMTU before it is saved; 0 means the default.
+func ValidateMTU(mtu int) error {
+	if mtu < 0 || mtu > MaxMTU {
+		return fmt.Errorf("invalid mtu %d (must be 0..%d)", mtu, MaxMTU)
+	}
+	return nil
+}
+
+// EffectiveMTU is the admin's value when set, else DefaultMTU minus S4: s4 junk
+// is prepended to every transport packet and never clamped against the MTU.
+func EffectiveMTU(configuredMTU, s4 int) int {
+	if configuredMTU > 0 {
+		// A row saved before ValidateMTU existed may still carry a wider value.
+		return min(configuredMTU, MaxMTU)
+	}
+	return max(DefaultMTU-max(s4, 0), 1280)
+}
+
 // GenerateObfuscation31 produces a randomized AmneziaWG 3.1 parameter set: a
 // static value gets profiled by DPI, defeating the point.
 func GenerateObfuscation31() Obfuscation31 {
@@ -51,7 +76,7 @@ func GenerateObfuscation31() Obfuscation31 {
 	}
 	// Floored at 12: HeaderProtectionKey is always generated below, and IpcSet
 	// rejects header protection unless every S1-S4 is >= 12.
-	o.S3 = randInt(12, 55) // cookie padding (max 64)
+	o.S3 = randInt(12, 55) // cookie padding
 	o.S4 = randInt(12, 27) // transport padding (max 32)
 
 	h := generateHValues()
@@ -113,12 +138,66 @@ func generateHValues() [4]string {
 	const lo = 5
 	bandSize := (awgHMax - lo + 1) / 4
 	var out [4]string
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		bandLo := lo + i*bandSize
 		bandHi := bandLo + bandSize - 1
 		out[i] = fmt.Sprintf("%d", randInt(bandLo, bandHi))
 	}
 	return out
+}
+
+// Padded handshake messages (148+S1, 92+S2, 64+S3 bytes) must fit the smallest receive
+// buffer amneziawg-go has: MaxSegmentSize 1700 on iOS (device/queueconstants_ios.go).
+const (
+	maxServerS1 = 1700 - 148
+	maxServerS2 = 1700 - 92
+	maxServerS3 = 1700 - 64
+)
+
+// ValidateServerObfuscation adds the receive-buffer bounds to ValidateObfuscation:
+// an inbound's peers may be iOS clients, which cannot receive a larger handshake.
+func ValidateServerObfuscation(o Obfuscation31) error {
+	if err := ValidateObfuscation(o); err != nil {
+		return err
+	}
+	for _, f := range []struct {
+		name   string
+		v, max int
+	}{{"S1", o.S1, maxServerS1}, {"S2", o.S2, maxServerS2}, {"S3", o.S3, maxServerS3}} {
+		if f.v > f.max {
+			return fmt.Errorf("invalid %s value %d (must be 0..%d so every client can receive it)", f.name, f.v, f.max)
+		}
+	}
+	return nil
+}
+
+const (
+	// maxJunkPackets is the Jc range AmneziaWG documents.
+	maxJunkPackets = 128
+	// maxPreamblePacket is amneziawg-go's MaxSegmentSize: each junk and signature packet is one datagram.
+	maxPreamblePacket = 65535
+)
+
+// ValidateHandshakePreamble bounds what every handshake initiation allocates: Jc junk
+// packets of Jmin..Jmax bytes and the I1-I5 signature packets. Device setup runs it too.
+func ValidateHandshakePreamble(o Obfuscation31) error {
+	if o.Jmin > o.Jmax {
+		return fmt.Errorf("invalid Jmin/Jmax: %d must not exceed %d", o.Jmin, o.Jmax)
+	}
+	for _, f := range []struct {
+		name   string
+		v, max int
+	}{{"Jc", o.Jc, maxJunkPackets}, {"Jmin", o.Jmin, maxPreamblePacket}, {"Jmax", o.Jmax, maxPreamblePacket}} {
+		if f.v < 0 || f.v > f.max {
+			return fmt.Errorf("invalid %s value %d (must be 0..%d)", f.name, f.v, f.max)
+		}
+	}
+	for i, spec := range []string{o.I1, o.I2, o.I3, o.I4, o.I5} {
+		if err := validateObfChain(spec); err != nil {
+			return fmt.Errorf("invalid I%d: %w", i+1, err)
+		}
+	}
+	return nil
 }
 
 // ValidateObfuscation rejects malformed parameters before they are saved, so
@@ -128,33 +207,23 @@ func generateHValues() [4]string {
 // are allowed (they fall back to a default); each accepts an integer or a
 // "100-800" range.
 func ValidateObfuscation(o Obfuscation31) error {
-	if o.Jmin > o.Jmax {
-		return fmt.Errorf("invalid Jmin/Jmax: %d must not exceed %d", o.Jmin, o.Jmax)
+	if err := ValidateHandshakePreamble(o); err != nil {
+		return err
 	}
-	// amneziawg-go parses jc/jmin/jmax as uint32 and s1-s4 as uint16
-	// (device/uapi.go); a wider value makes IpcSet reject the whole device.
+	// amneziawg-go parses s1-s3 as uint16 (device/uapi.go); a wider value makes IpcSet
+	// reject the whole device.
 	for _, f := range []struct {
 		name string
 		v    int
 		max  int64
 	}{
-		{"Jc", o.Jc, math.MaxUint32},
-		{"Jmin", o.Jmin, math.MaxUint32},
-		{"Jmax", o.Jmax, math.MaxUint32},
 		{"S1", o.S1, math.MaxUint16},
 		{"S2", o.S2, math.MaxUint16},
+		{"S3", o.S3, math.MaxUint16},
 	} {
 		if int64(f.v) < 0 || int64(f.v) > f.max {
 			return fmt.Errorf("invalid %s value %d (must be 0..%d)", f.name, f.v, f.max)
 		}
-	}
-	for i, spec := range []string{o.I1, o.I2, o.I3, o.I4, o.I5} {
-		if err := validateObfChain(spec); err != nil {
-			return fmt.Errorf("invalid I%d: %w", i+1, err)
-		}
-	}
-	if o.S3 < 0 || o.S3 > 64 {
-		return fmt.Errorf("invalid S3 value %d (must be 0..64)", o.S3)
 	}
 	if o.S4 < 0 || o.S4 > 32 {
 		return fmt.Errorf("invalid S4 value %d (must be 0..32)", o.S4)
@@ -166,6 +235,9 @@ func ValidateObfuscation(o Obfuscation31) error {
 		if err := validateUintRange(h, 0); err != nil {
 			return fmt.Errorf("invalid H%d: %w", i+1, err)
 		}
+	}
+	if err := validateHNoOverlap([4]string{o.H1, o.H2, o.H3, o.H4}); err != nil {
+		return err
 	}
 	if err := validateHeaderProtectionKey(o.HeaderProtectionKey); err != nil {
 		return err
@@ -224,6 +296,7 @@ func validateObfChain(spec string) error {
 		return nil
 	}
 	remaining := spec
+	total := 0
 	for {
 		start := strings.IndexByte(remaining, '<')
 		if start == -1 {
@@ -239,6 +312,29 @@ func validateObfChain(spec string) error {
 		}
 		if !obfChainTags[fields[0]] {
 			return fmt.Errorf("spec %q uses unknown tag <%s>", spec, fields[0])
+		}
+		// The packet is built once per handshake initiation, so what it allocates is bounded.
+		switch fields[0] {
+		case "r", "rc", "rd", "dz":
+			n := -1
+			if len(fields) == 2 {
+				if v, err := strconv.Atoi(fields[1]); err == nil {
+					n = v
+				}
+			}
+			if n < 0 || n > maxPreamblePacket {
+				return fmt.Errorf("spec %q: <%s> needs a length of 0..%d", spec, fields[0], maxPreamblePacket)
+			}
+			total += n
+		case "b":
+			if len(fields) == 2 {
+				total += len(strings.TrimPrefix(fields[1], "0x")) / 2
+			}
+		case "t":
+			total += 4
+		}
+		if total > maxPreamblePacket {
+			return fmt.Errorf("spec %q builds more than %d bytes", spec, maxPreamblePacket)
 		}
 		remaining = remaining[start+end+1:]
 	}
@@ -327,14 +423,8 @@ func ValidateSubnetIPv4(subnetIP string, subnetCIDR int) error {
 	return nil
 }
 
-// ValidateConfigValue rejects control characters in any value interpolated
-// verbatim into a rendered .conf: a newline re-opens an [Interface] section
-// whose "PostUp = ..." runs as root the moment whoever downloaded that
-// config -- the client app, or an admin importing it into the official
-// awg-quick CLI directly -- applies it. The panel's own server side never
-// runs awg-quick itself (internal/amneziawgnet applies config via
-// amneziawg-go's UAPI, not a parsed text file), but this exact value still
-// reaches a real text-based config downstream. field names the value.
+// ValidateConfigValue rejects control characters in values written to AWG configs,
+// preventing newline injection into config directives and awg-quick hooks.
 func ValidateConfigValue(field, v string) error {
 	for _, r := range v {
 		if r == '\n' || r == '\r' || r < 0x20 || r == 0x7f {
@@ -361,6 +451,27 @@ func validateUintRange(v string, minAllowed int64) error {
 	}
 	if lo < minAllowed || hi > hMaxValid || lo > hi {
 		return fmt.Errorf("range %q must satisfy %d <= low <= high <= %d", v, minAllowed, hMaxValid)
+	}
+	return nil
+}
+
+// validateHNoOverlap mirrors amneziawg-go's "headers must not overlap" (device/uapi.go).
+// A blank Hn is never sent, so the engine keeps its default: WireGuard's own type n.
+func validateHNoOverlap(hs [4]string) error {
+	var lo, hi [4]int64
+	for i, h := range hs {
+		l, u, ok := parseUintRange(h)
+		if !ok {
+			l, u = int64(i+1), int64(i+1)
+		}
+		lo[i], hi[i] = l, u
+	}
+	for i := range 4 {
+		for j := i + 1; j < 4; j++ {
+			if lo[i] <= hi[j] && lo[j] <= hi[i] {
+				return fmt.Errorf("invalid H%d/H%d: %d-%d and %d-%d overlap", i+1, j+1, lo[i], hi[i], lo[j], hi[j])
+			}
+		}
 	}
 	return nil
 }

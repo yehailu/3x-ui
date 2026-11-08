@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { NativeSelect } from '@/components/form/NativeSelect';
+import { useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Form, Input, InputNumber, Select, Space, Typography } from 'antd';
+import { Button, Form, Input, InputNumber, Space, Typography } from 'antd';
 import { Controller, useFormContext } from 'react-hook-form';
 
 import { FormField } from '@/components/form/rhf';
@@ -26,6 +27,7 @@ export default function VlessFields({
   clearVlessEnc,
 }: VlessFieldsProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const { control } = useFormContext();
   const [authKind, setAuthKind] = useState<VlessAuthKind>(vlessAuthKind ?? 'x25519');
 
@@ -47,9 +49,10 @@ export default function VlessFields({
       <FormField name={['settings', 'encryption']} label={t('pages.inbounds.encryption')}>
         <Input />
       </FormField>
-      <Form.Item label={t('pages.inbounds.vlessAuthGenerate')}>
+      <Form.Item htmlFor={`${uid}-authKind`} label={t('pages.inbounds.vlessAuthGenerate')}>
         <Space size={8} wrap>
-          <Select
+          <NativeSelect
+            id={`${uid}-authKind`}
             value={authKind}
             onChange={(v) => setAuthKind(v)}
             options={authOptions}
@@ -80,6 +83,7 @@ export default function VlessFields({
                 defaultValue={def}
                 render={({ field }) => (
                   <InputNumber
+                    aria-label={`${t('pages.inbounds.form.visionTestseed')} ${i + 1}`}
                     min={1}
                     style={{ width: '25%' }}
                     value={field.value as number}

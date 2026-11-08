@@ -4,6 +4,10 @@ import { generateAwgObfuscation } from '@/lib/xray/amneziawg-obfuscation';
 import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
 import type { HttpInboundSettings } from '@/schemas/protocols/inbound/http';
 import type { HysteriaClient, HysteriaInboundSettings } from '@/schemas/protocols/inbound/hysteria';
+import {
+  MASQUE_DEFAULT_ADDRESS_POOL,
+  type MasqueInboundSettings,
+} from '@/schemas/protocols/inbound/masque';
 import type { MixedInboundSettings } from '@/schemas/protocols/inbound/mixed';
 import type { MtprotoClient, MtprotoInboundSettings } from '@/schemas/protocols/inbound/mtproto';
 import type {
@@ -11,6 +15,7 @@ import type {
   ShadowsocksInboundSettings,
 } from '@/schemas/protocols/inbound/shadowsocks';
 import type { TrojanClient, TrojanInboundSettings } from '@/schemas/protocols/inbound/trojan';
+import type { TuicClient, TuicInboundSettings } from '@/schemas/protocols/inbound/tuic';
 import type { TunInboundSettings } from '@/schemas/protocols/inbound/tun';
 import type { TunnelInboundSettings } from '@/schemas/protocols/inbound/tunnel';
 import type { VlessClient, VlessInboundSettings } from '@/schemas/protocols/inbound/vless';
@@ -133,6 +138,22 @@ export interface HysteriaClientSeed extends ClientBaseSeed {
 export function createDefaultHysteriaClient(seed: HysteriaClientSeed = {}): HysteriaClient {
   return {
     auth: seed.auth ?? RandomUtil.randomSeq(10),
+    ...clientBase(seed),
+  };
+}
+
+export interface TuicClientSeed extends ClientBaseSeed {
+  uuid?: string;
+  id?: string;
+  password?: string;
+}
+
+export function createDefaultTuicClient(seed: TuicClientSeed = {}): TuicClient {
+  const uuid = seed.uuid ?? seed.id ?? RandomUtil.randomUUID();
+  return {
+    uuid,
+    id: uuid,
+    password: seed.password ?? RandomUtil.randomSeq(10),
     ...clientBase(seed),
   };
 }
@@ -312,10 +333,34 @@ export function createDefaultAmneziawgInboundSettings(): AmneziawgInboundSetting
       primaryDns: '8.8.8.8',
       secondaryDns: '8.8.4.4',
       externalInterface: '',
+      kernelMode: false,
       ipv6Enabled: false,
       ipv6Subnet: '',
       ipv6ExternalInterface: '',
       ...generateAwgObfuscation(),
+    },
+    clients: [],
+  };
+}
+
+export function createDefaultMasqueInboundSettings(): MasqueInboundSettings {
+  return { clients: [], address: [...MASQUE_DEFAULT_ADDRESS_POOL] };
+}
+
+export function createDefaultTuicInboundSettings(): TuicInboundSettings {
+  return {
+    server: {
+      certificate: '',
+      private_key: '',
+      congestion_control: 'bbr',
+      alpn: ['h3', 'spdy/3.1'],
+      udp_relay_mode: 'native',
+      zero_rtt_handshake: true,
+      log_level: 'info',
+      max_idle_time: 15,
+      authentication_timeout: 3,
+      max_udp_relay_packet_size: 1500,
+      sni: '',
     },
     clients: [],
   };
@@ -338,7 +383,9 @@ export type AnyInboundSettings =
   | TunnelInboundSettings
   | WireguardInboundSettings
   | MtprotoInboundSettings
-  | AmneziawgInboundSettings;
+  | AmneziawgInboundSettings
+  | TuicInboundSettings
+  | MasqueInboundSettings;
 
 export function createDefaultInboundSettings(protocol: string): AnyInboundSettings | null {
   switch (protocol) {
@@ -366,6 +413,10 @@ export function createDefaultInboundSettings(protocol: string): AnyInboundSettin
       return createDefaultMtprotoInboundSettings();
     case 'amneziawg':
       return createDefaultAmneziawgInboundSettings();
+    case 'tuic':
+      return createDefaultTuicInboundSettings();
+    case 'masque':
+      return createDefaultMasqueInboundSettings();
     default:
       return null;
   }

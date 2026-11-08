@@ -30,6 +30,8 @@ import {
   findAmneziaWGInbounds,
   isAmneziaWGClient,
 } from './amneziawgConfig';
+import { tunnelConfigEndpoints, tunnelEndpointLabel } from './tunnelEndpoints';
+import type { HostRecord } from '@/schemas/api/host';
 import './ClientInfoModal.css';
 
 const INBOUND_PROTOCOL_COLORS: Record<string, string> = {
@@ -44,6 +46,7 @@ const INBOUND_PROTOCOL_COLORS: Record<string, string> = {
   http: 'purple',
   mixed: 'lime',
   tunnel: 'orange',
+  tuic: 'orange',
 };
 
 const INBOUND_CHIP_LIMIT = 1;
@@ -65,8 +68,11 @@ interface ClientInfoModalProps {
   tunnelAllowedIPs?: Record<number, string>;
   isOnline: boolean;
   subSettings?: SubSettings;
+  hosts?: HostRecord[];
   onOpenChange: (open: boolean) => void;
 }
+
+const NO_HOSTS: HostRecord[] = [];
 
 interface ApiMsg<T = unknown> {
   success?: boolean;
@@ -96,6 +102,7 @@ export default function ClientInfoModal({
   tunnelAllowedIPs,
   isOnline,
   subSettings = DEFAULT_SUB,
+  hosts = NO_HOSTS,
   onOpenChange,
 }: ClientInfoModalProps) {
   const { datepicker } = useDatepicker();
@@ -186,20 +193,19 @@ export default function ClientInfoModal({
   );
   const wgConfigs = useMemo(() => {
     if (!client || !isWireguardClient(client)) return [];
+    const host = window.location.hostname;
+    const publicHost = subSettings?.publicHost ?? '';
     return wgInbounds
-      .map((ib) => {
+      .flatMap((ib) => {
         const address = tunnelAllowedIPs?.[ib.id] ?? '';
-        const text = buildWireguardClientConfig(
-          client,
-          ib,
-          window.location.hostname,
-          subSettings?.publicHost ?? '',
-          address,
-        );
-        return { inbound: ib, text };
+        return tunnelConfigEndpoints(ib, hosts, host, publicHost).map((ep) => ({
+          inbound: ib,
+          endpoint: tunnelEndpointLabel(ep),
+          text: buildWireguardClientConfig(client, ib, host, publicHost, address, ep),
+        }));
       })
       .filter((c) => !!c.text);
-  }, [client, wgInbounds, tunnelAllowedIPs, subSettings?.publicHost]);
+  }, [client, wgInbounds, tunnelAllowedIPs, subSettings?.publicHost, hosts]);
 
   const awgInbounds = useMemo(
     () => findAmneziaWGInbounds(client, inboundsById),
@@ -207,20 +213,19 @@ export default function ClientInfoModal({
   );
   const awgConfigs = useMemo(() => {
     if (!client || !isAmneziaWGClient(client)) return [];
+    const host = window.location.hostname;
+    const publicHost = subSettings?.publicHost ?? '';
     return awgInbounds
-      .map((ib) => {
+      .flatMap((ib) => {
         const address = tunnelAllowedIPs?.[ib.id] ?? '';
-        const text = buildAmneziaWGClientConfig(
-          client,
-          ib,
-          window.location.hostname,
-          subSettings?.publicHost ?? '',
-          address,
-        );
-        return { inbound: ib, text };
+        return tunnelConfigEndpoints(ib, hosts, host, publicHost).map((ep) => ({
+          inbound: ib,
+          endpoint: tunnelEndpointLabel(ep),
+          text: buildAmneziaWGClientConfig(client, ib, host, publicHost, address, ep),
+        }));
       })
       .filter((c) => !!c.text);
-  }, [client, awgInbounds, tunnelAllowedIPs, subSettings?.publicHost]);
+  }, [client, awgInbounds, tunnelAllowedIPs, subSettings?.publicHost, hosts]);
 
   async function copyValue(text: string) {
     if (!text) return;
@@ -345,7 +350,7 @@ export default function ClientInfoModal({
                       <Button
                         size="small"
                         type="text"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyValue(client.subId!)}
                       />
@@ -360,7 +365,7 @@ export default function ClientInfoModal({
                       <Button
                         size="small"
                         type="text"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyValue(client.uuid!)}
                       />
@@ -375,7 +380,7 @@ export default function ClientInfoModal({
                       <Button
                         size="small"
                         type="text"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyValue(client.password!)}
                       />
@@ -390,7 +395,7 @@ export default function ClientInfoModal({
                       <Button
                         size="small"
                         type="text"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyValue(client.auth!)}
                       />
@@ -452,7 +457,7 @@ export default function ClientInfoModal({
                   <td>
                     <Button
                       size="small"
-                      icon={<EyeOutlined />}
+                      icon={<EyeOutlined aria-hidden />}
                       aria-label={t('pages.clients.ipLog')}
                       loading={ipsLoading}
                       onClick={openIpsModal}
@@ -484,7 +489,7 @@ export default function ClientInfoModal({
                   <td>
                     <Button
                       size="small"
-                      icon={<EyeOutlined />}
+                      icon={<EyeOutlined aria-hidden />}
                       aria-label={t('pages.clients.hwidLog')}
                       loading={hwidsLoading}
                       onClick={openHwidsModal}
@@ -586,7 +591,7 @@ export default function ClientInfoModal({
                     <Tooltip title={t('copy')}>
                       <Button
                         size="small"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyValue(subLink)}
                       />
@@ -594,7 +599,7 @@ export default function ClientInfoModal({
                     <Tooltip title={t('download')}>
                       <Button
                         size="small"
-                        icon={<DownloadOutlined />}
+                        icon={<DownloadOutlined aria-hidden />}
                         aria-label={t('download')}
                         loading={downloadingFormat === 'standard'}
                         disabled={downloadingFormat !== null}
@@ -616,7 +621,7 @@ export default function ClientInfoModal({
                       <Tooltip title={t('pages.clients.qrCode')}>
                         <Button
                           size="small"
-                          icon={<QrcodeOutlined />}
+                          icon={<QrcodeOutlined aria-hidden />}
                           aria-label={t('pages.clients.qrCode')}
                         />
                       </Tooltip>
@@ -641,7 +646,7 @@ export default function ClientInfoModal({
                       <Tooltip title={t('copy')}>
                         <Button
                           size="small"
-                          icon={<CopyOutlined />}
+                          icon={<CopyOutlined aria-hidden />}
                           aria-label={t('copy')}
                           onClick={() => copyValue(subJsonLink)}
                         />
@@ -649,7 +654,7 @@ export default function ClientInfoModal({
                       <Tooltip title={t('download')}>
                         <Button
                           size="small"
-                          icon={<DownloadOutlined />}
+                          icon={<DownloadOutlined aria-hidden />}
                           aria-label={t('download')}
                           loading={downloadingFormat === 'json'}
                           disabled={downloadingFormat !== null}
@@ -671,7 +676,7 @@ export default function ClientInfoModal({
                         <Tooltip title={t('pages.clients.qrCode')}>
                           <Button
                             size="small"
-                            icon={<QrcodeOutlined />}
+                            icon={<QrcodeOutlined aria-hidden />}
                             aria-label={t('pages.clients.qrCode')}
                           />
                         </Tooltip>
@@ -699,7 +704,7 @@ export default function ClientInfoModal({
                       <Tooltip title={t('copy')}>
                         <Button
                           size="small"
-                          icon={<CopyOutlined />}
+                          icon={<CopyOutlined aria-hidden />}
                           aria-label={t('copy')}
                           onClick={() => copyValue(subClashLink)}
                         />
@@ -707,7 +712,7 @@ export default function ClientInfoModal({
                       <Tooltip title={t('download')}>
                         <Button
                           size="small"
-                          icon={<DownloadOutlined />}
+                          icon={<DownloadOutlined aria-hidden />}
                           aria-label={t('download')}
                           loading={downloadingFormat === 'clash'}
                           disabled={downloadingFormat !== null}
@@ -729,7 +734,7 @@ export default function ClientInfoModal({
                         <Tooltip title={t('pages.clients.qrCode')}>
                           <Button
                             size="small"
-                            icon={<QrcodeOutlined />}
+                            icon={<QrcodeOutlined aria-hidden />}
                             aria-label={t('pages.clients.qrCode')}
                           />
                         </Tooltip>
@@ -763,7 +768,7 @@ export default function ClientInfoModal({
                         <Tooltip title={t('copy')}>
                           <Button
                             size="small"
-                            icon={<CopyOutlined />}
+                            icon={<CopyOutlined aria-hidden />}
                             aria-label={t('copy')}
                             onClick={() => copyValue(link)}
                           />
@@ -778,7 +783,7 @@ export default function ClientInfoModal({
                             <Tooltip title={t('pages.clients.qrCode')}>
                               <Button
                                 size="small"
-                                icon={<QrcodeOutlined />}
+                                icon={<QrcodeOutlined aria-hidden />}
                                 aria-label={t('pages.clients.qrCode')}
                               />
                             </Tooltip>
@@ -794,11 +799,16 @@ export default function ClientInfoModal({
             {wgConfigs.length > 0 && client && (
               <>
                 <Divider>{t('pages.clients.wireguardConfig')}</Divider>
-                {wgConfigs.map(({ inbound, text }) => {
-                  const meta = formatTunnelConfigMeta(inbound, client.email, wgConfigs.length);
+                {wgConfigs.map(({ inbound, endpoint, text }) => {
+                  const meta = formatTunnelConfigMeta(
+                    inbound,
+                    client.email,
+                    wgConfigs.length,
+                    endpoint,
+                  );
                   return (
                     <ConfigBlock
-                      key={`wg-${inbound.id}`}
+                      key={`wg-${inbound.id}-${endpoint}`}
                       label={meta.label || t('pages.clients.config')}
                       text={text}
                       fileName={meta.fileName}
@@ -813,11 +823,16 @@ export default function ClientInfoModal({
             {awgConfigs.length > 0 && client && (
               <>
                 <Divider>{t('pages.clients.amneziaWgConfig')}</Divider>
-                {awgConfigs.map(({ inbound, text }) => {
-                  const meta = formatTunnelConfigMeta(inbound, client.email, awgConfigs.length);
+                {awgConfigs.map(({ inbound, endpoint, text }) => {
+                  const meta = formatTunnelConfigMeta(
+                    inbound,
+                    client.email,
+                    awgConfigs.length,
+                    endpoint,
+                  );
                   return (
                     <ConfigBlock
-                      key={`awg-${inbound.id}`}
+                      key={`awg-${inbound.id}-${endpoint}`}
                       label={meta.label || t('pages.clients.config')}
                       text={text}
                       fileName={meta.fileName}
@@ -838,7 +853,12 @@ export default function ClientInfoModal({
         width={440}
         onCancel={() => setIpsModalOpen(false)}
         footer={[
-          <Button key="refresh" icon={<ReloadOutlined />} loading={ipsLoading} onClick={loadIps}>
+          <Button
+            key="refresh"
+            icon={<ReloadOutlined aria-hidden />}
+            loading={ipsLoading}
+            onClick={loadIps}
+          >
             {t('refresh')}
           </Button>,
           <Button

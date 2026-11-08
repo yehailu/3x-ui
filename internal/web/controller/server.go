@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/netsafe"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/entity"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/global"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
@@ -106,7 +108,7 @@ func (a *ServerController) startTask() {
 }
 
 // status returns the current server status information.
-func (a *ServerController) status(c *gin.Context) { jsonObj(c, a.serverService.LastStatus(), nil) }
+func (a *ServerController) status(c *gin.Context) { jsonObj(c, a.serverService.CurrentStatus(), nil) }
 
 func (a *ServerController) getFail2banStatus(c *gin.Context) {
 	jsonObj(c, a.serverService.GetFail2banStatus(), nil)
@@ -391,6 +393,9 @@ func (a *ServerController) importDB(c *gin.Context) {
 		jsonMsg(c, I18nWeb(c, "pages.index.importDatabaseError"), err)
 		return
 	}
+	// Startup-registered routes (subPath) must match the restored DB, and the
+	// browser's restartPanel follow-up can 401 once the imported users land (#6446).
+	_ = a.panelService.RestartPanel(3 * time.Second)
 	jsonObj(c, I18nWeb(c, "pages.index.importDatabaseSuccess"), nil)
 }
 
@@ -464,7 +469,12 @@ func (a *ServerController) getCertHash(c *gin.Context) {
 // getRemoteCertHash runs `xray tls ping` against the given server and returns
 // its live certificate SHA-256 hash(es) for pinning.
 func (a *ServerController) getRemoteCertHash(c *gin.Context) {
-	hashes, err := a.serverService.GetRemoteCertHash(c.PostForm("server"))
+	allowPrivate := c.PostForm("allowPrivate") == "true"
+	hashes, err := a.serverService.GetRemoteCertHash(c.PostForm("server"), allowPrivate)
+	if errors.Is(err, netsafe.ErrPrivateAddressBlocked) {
+		jsonMsgObj(c, "get remote cert hash", gin.H{"privateTarget": true}, err)
+		return
+	}
 	if err != nil {
 		jsonMsg(c, "get remote cert hash", err)
 		return
@@ -485,9 +495,8 @@ func (a *ServerController) scanRealityTarget(c *gin.Context) {
 	jsonObj(c, res, nil)
 }
 
-// scanRealityTargets probes a batch of candidate REALITY targets (the supplied
-// comma-separated list, or the built-in seed set when empty) and returns each
-// verdict ranked by feasibility then latency.
+// scanRealityTargets probes the supplied comma-separated targets, or the
+// realityScanCandidates setting when empty, ranked by feasibility then latency.
 func (a *ServerController) scanRealityTargets(c *gin.Context) {
 	res, err := a.serverService.ScanRealityTargets(c.PostForm("targets"))
 	if err != nil {

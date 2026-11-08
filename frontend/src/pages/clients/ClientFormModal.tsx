@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AutoComplete,
@@ -37,10 +37,16 @@ import { normalizeClientIps, type ClientIpInfo } from '@/lib/clients/ip-log';
 import { resolveExternalLinkExpiry } from '@/lib/clients/external-link';
 import { useDatepicker } from '@/hooks/useDatepicker';
 import { useClientHwids } from '@/hooks/useClientHwids';
-import { DateTimePicker, SelectAllClearButtons } from '@/components/form';
-import { FormField } from '@/components/form/rhf';
+import { useRawHostsQuery } from '@/api/queries/useRawHostsQuery';
+import { DateTimePicker, SelectAllClearButtons, selectTagRender } from '@/components/form';
+import { FormField, rhfZodValidate } from '@/components/form/rhf';
 import ClientHwidListModal from '@/components/clients/ClientHwidList';
 import { TLS_FLOW_CONTROL, TRAFFIC_RESETS } from '@/schemas/primitives';
+import {
+  OptionalAmneziaWGKeepAliveInputSchema,
+  OptionalNumericKeepAliveInputSchema,
+  keepAliveInputValue,
+} from '@/schemas/primitives/keepalive';
 import type {
   ClientRecord,
   InboundOption,
@@ -48,7 +54,9 @@ import type {
   ExternalLinkInput,
 } from '@/hooks/useClients';
 import { useFail2banStatusQuery, getLimitIpNotice } from '@/api/queries/useFail2banStatusQuery';
+import ClientRenewalFields from './ClientRenewalFields';
 import { ClientFormSchema, ClientCreateFormSchema, type ClientFormValues } from '@/schemas/client';
+import './ClientFormModal.css';
 
 const FLOW_OPTIONS = Object.values(TLS_FLOW_CONTROL);
 const VMESS_SECURITY_OPTIONS = ['auto', 'aes-128-gcm', 'chacha20-poly1305'] as const;
@@ -62,6 +70,8 @@ const MULTI_CLIENT_PROTOCOLS = new Set([
   'wireguard',
   'mtproto',
   'amneziawg',
+  'tuic',
+  'masque',
 ]);
 
 const CLIENT_FORM_MODAL_Z_INDEX = 1000;
@@ -127,12 +137,14 @@ type Values = ClientFormValues & {
   expiryDate: number;
   limitHwid: number;
   externalLinks: ExternalLinkRow[];
+  clientHostRuleIds: number[];
   wgPrivateKey: string;
   wgPublicKey: string;
   wgPreSharedKey: string;
   wgAllowedIPs: string;
   awgAllowedIPs: string;
   awgForwardedPorts: string;
+  wgKeepAlive: number | string | undefined;
   secret: string;
   adTag: string;
 };
@@ -145,6 +157,7 @@ const EMPTY: Values = {
   auth: '',
   flow: '',
   security: 'auto',
+  clientHostRuleIds: [],
   reverseTag: '',
   totalGB: 0,
   expiryDate: 0,
@@ -152,6 +165,7 @@ const EMPTY: Values = {
   delayedDays: 0,
   reset: 0,
   resetDay: 0,
+  resetWeekday: 0,
   resetMax: 0,
   trafficReset: 'never' as const,
   trafficResetDay: 1,
@@ -169,6 +183,7 @@ const EMPTY: Values = {
   wgAllowedIPs: '',
   awgAllowedIPs: '',
   awgForwardedPorts: '',
+  wgKeepAlive: 25,
   secret: '',
   adTag: '',
 };
@@ -249,12 +264,14 @@ export default function ClientFormModal({
   onOpenChange,
 }: ClientFormModalProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const [messageApi, messageContextHolder] = message.useMessage();
   const isEdit = mode === 'edit';
 
   const methods = useForm<Values>({ defaultValues: EMPTY });
   const inboundIds = useWatch({ control: methods.control, name: 'inboundIds' });
   const delayedStart = useWatch({ control: methods.control, name: 'delayedStart' });
+  const delayedDays = useWatch({ control: methods.control, name: 'delayedDays' });
   const expiryDate = useWatch({ control: methods.control, name: 'expiryDate' });
   const enable = useWatch({ control: methods.control, name: 'enable' });
   const flow = useWatch({ control: methods.control, name: 'flow' });
@@ -359,9 +376,15 @@ export default function ClientFormModal({
             ? 'auto'
             : client.security,
         reverseTag: client.reverse?.tag || '',
+        clientHostRuleIds: [
+          ...new Set(
+            (client.clientHostRuleIds || []).filter((id) => Number.isInteger(id) && id > 0),
+          ),
+        ],
         totalGB: bytesToGB(client.totalGB || 0),
         reset: Number(client.reset) || 0,
         resetDay: Number(client.resetDay) || 0,
+        resetWeekday: Number(client.resetWeekday) || 0,
         resetMax: Number(client.resetMax) || 0,
         trafficReset: (client.trafficReset as ClientFormValues['trafficReset']) || 'never',
         trafficResetDay: Number(client.trafficResetDay) || 1,
@@ -379,6 +402,7 @@ export default function ClientFormModal({
         wgAllowedIPs: wgTunnelIPs ?? client.allowedIPs ?? '',
         awgAllowedIPs: awgTunnelIPs ?? client.allowedIPs ?? '',
         awgForwardedPorts: client.forwardedPorts || '',
+        wgKeepAlive: client.keepAlive,
         secret: client.secret || '',
         adTag: client.adTag || '',
       };
@@ -505,6 +529,10 @@ export default function ClientFormModal({
     methods.setValue('wgPublicKey', kp.publicKey);
   }
 
+  function regenerateWireguardPresharedKey() {
+    methods.setValue('wgPreSharedKey', Wireguard.keyToBase64(Wireguard.generatePresharedKey()));
+  }
+
   function regenerateMtprotoSecret() {
     methods.setValue('secret', generateMtprotoSecret(mtprotoDomain));
   }
@@ -552,6 +580,66 @@ export default function ClientFormModal({
         })),
     [inbounds, inboundIds],
   );
+
+  // Host options cover selected inbounds only; bound disabled hosts stay
+  // visible with a suffix so open+save never silently drops them.
+  const { hosts: rawHostRules } = useRawHostsQuery();
+  const clientHostRuleIds = useWatch({ control: methods.control, name: 'clientHostRuleIds' });
+  const hostRuleOptions = useMemo(() => {
+    const selected = new Set(inboundIds || []);
+    const bound = new Set(clientHostRuleIds || []);
+    const formatBase = (h: { id?: number; remark?: string; address?: string }) =>
+      h.remark || h.address
+        ? `${h.remark || h.address}${h.address && h.remark ? ` (${h.address})` : ''} (#${h.id})`
+        : `Host #${h.id}`;
+    const options: { value: number; label: string }[] = [];
+    const seen = new Set<number>();
+    for (const h of rawHostRules || []) {
+      if (h.id === undefined || h.inboundId === undefined || !selected.has(h.inboundId)) continue;
+      const id = h.id as number;
+      const base = formatBase(h);
+      if (!h.isDisabled) {
+        options.push({ value: id, label: base });
+        seen.add(id);
+      } else if (bound.has(id)) {
+        options.push({ value: id, label: t('pages.clients.hostRuleDisabled', { label: base }) });
+        seen.add(id);
+      }
+    }
+    for (const id of bound) {
+      if (seen.has(id)) continue;
+      const h = (rawHostRules || []).find((r) => r.id === id);
+      if (h) {
+        const base = formatBase(h);
+        options.push({
+          value: id,
+          label: h.isDisabled ? t('pages.clients.hostRuleDisabled', { label: base }) : base,
+        });
+      } else {
+        options.push({ value: id, label: `Host #${id}` });
+      }
+    }
+    return options;
+  }, [rawHostRules, inboundIds, clientHostRuleIds, t]);
+
+  // Prune only bindings whose inbound was just deselected, never on
+  // disabled state, so a temporarily disabled host survives untouched.
+  function handleInboundChange(next: number[]) {
+    const prevSelected = new Set(inboundIds || []);
+    const nextSelected = new Set(next || []);
+    const removed = new Set([...prevSelected].filter((id) => !nextSelected.has(id)));
+    methods.setValue('inboundIds', next);
+    if (removed.size === 0) return;
+    const current = methods.getValues('clientHostRuleIds') || [];
+    if (current.length === 0) return;
+    const byId = new Map((rawHostRules || []).map((h) => [h.id as number, h]));
+    const kept = current.filter((id) => {
+      const host = byId.get(id);
+      if (!host || host.inboundId === undefined) return true;
+      return !removed.has(host.inboundId);
+    });
+    if (kept.length !== current.length) methods.setValue('clientHostRuleIds', kept);
+  }
 
   const expiryDayjs = useMemo<Dayjs | null>(
     () => (expiryDate > 0 ? dayjs(expiryDate) : null),
@@ -626,6 +714,25 @@ export default function ClientFormModal({
 
   async function onSubmit() {
     const values = methods.getValues();
+    const unchangedLegacyKeepAlive =
+      isEdit &&
+      typeof client?.keepAlive === 'number' &&
+      client.keepAlive > 65535 &&
+      values.wgKeepAlive === client.keepAlive;
+    if (showAmneziawg && !unchangedLegacyKeepAlive) {
+      const keepAliveSchema = showWireguard
+        ? OptionalNumericKeepAliveInputSchema
+        : OptionalAmneziaWGKeepAliveInputSchema;
+      const keepAliveResult = keepAliveSchema.safeParse(values.wgKeepAlive);
+      if (!keepAliveResult.success) {
+        methods.setError('wgKeepAlive', {
+          type: 'validate',
+          message: keepAliveResult.error.issues[0]?.message ?? 'validation.invalid',
+        });
+        return;
+      }
+      methods.clearErrors('wgKeepAlive');
+    }
     const schema = isEdit ? ClientFormSchema : ClientCreateFormSchema;
     const validated = schema.safeParse({
       email: values.email,
@@ -635,12 +742,14 @@ export default function ClientFormModal({
       auth: values.auth,
       flow: values.flow,
       security: values.security,
+      clientHostRuleIds: values.clientHostRuleIds,
       reverseTag: values.reverseTag,
       totalGB: values.totalGB,
       delayedStart: values.delayedStart,
       delayedDays: values.delayedDays,
       reset: values.reset,
       resetDay: values.resetDay,
+      resetWeekday: values.resetWeekday,
       resetMax: values.resetMax,
       trafficReset: values.trafficReset,
       trafficResetDay: values.trafficResetDay,
@@ -665,14 +774,20 @@ export default function ClientFormModal({
       email: values.email.trim(),
       subId: values.subId,
       id: values.uuid,
+      uuid: values.uuid,
       password: values.password,
       auth: values.auth,
       flow: showFlow ? values.flow || '' : '',
       security: showSecurity ? values.security || 'auto' : 'auto',
+      // An empty list clears the override.
+      clientHostRuleIds: Array.isArray(values.clientHostRuleIds)
+        ? values.clientHostRuleIds.filter((id) => typeof id === 'number' && id > 0)
+        : [],
       totalGB: totalBytes,
       expiryTime,
       reset: Number(values.reset) || 0,
       resetDay: Number(values.resetDay) || 0,
+      resetWeekday: Number(values.resetWeekday) || 0,
       resetMax: Number(values.resetMax) || 0,
       trafficReset: values.trafficReset || 'never',
       trafficResetDay: Number(values.trafficResetDay) || 1,
@@ -683,10 +798,10 @@ export default function ClientFormModal({
       comment: values.comment,
       enable: !!values.enable,
     };
+    // Sent even when empty, so clearing the tag never rests on how the server
+    // reads an omitted key.
     const reverseTagValue = showReverseTag ? (values.reverseTag || '').trim() : '';
-    if (reverseTagValue) {
-      clientPayload.reverse = { tag: reverseTagValue };
-    }
+    clientPayload.reverse = reverseTagValue ? { tag: reverseTagValue } : null;
 
     if (showWireguard || showAmneziawg) {
       // AmneziaWG peers are wire-identical to WireGuard peers (same
@@ -694,6 +809,9 @@ export default function ClientFormModal({
       // so both protocols share this one field set — see wgPrivateKey etc.
       // below and the AmneziaWG-labeled variants of the same inputs.
       clientPayload.privateKey = values.wgPrivateKey;
+      if (!unchangedLegacyKeepAlive && values.wgKeepAlive !== undefined) {
+        clientPayload.keepAlive = values.wgKeepAlive;
+      }
       clientPayload.publicKey = values.wgPublicKey;
       if (values.wgPreSharedKey) {
         clientPayload.preSharedKey = values.wgPreSharedKey;
@@ -780,6 +898,7 @@ export default function ClientFormModal({
         open={open}
         title={isEdit ? t('pages.clients.editClient') : t('pages.clients.addClient')}
         destroyOnHidden
+        className="client-form-modal"
         width={720}
         zIndex={CLIENT_FORM_MODAL_Z_INDEX}
         style={{ top: 20 }}
@@ -801,7 +920,7 @@ export default function ClientFormModal({
                 <Button
                   color="danger"
                   variant="filled"
-                  icon={<RetweetOutlined />}
+                  icon={<RetweetOutlined aria-hidden />}
                   loading={resetting}
                 >
                   {t('pages.inbounds.resetTraffic')}
@@ -829,9 +948,14 @@ export default function ClientFormModal({
                     <>
                       <Row gutter={16}>
                         <Col xs={24} md={12}>
-                          <Form.Item label={t('pages.clients.email')} required>
+                          <Form.Item
+                            label={t('pages.clients.email')}
+                            required
+                            htmlFor={`${uid}-email`}
+                          >
                             <Space.Compact style={{ display: 'flex' }}>
                               <Input
+                                id={`${uid}-email`}
                                 value={email}
                                 placeholder={t('pages.clients.email')}
                                 style={{ flex: 1 }}
@@ -840,7 +964,7 @@ export default function ClientFormModal({
                               {!isEdit && (
                                 <Button
                                   aria-label={t('regenerate')}
-                                  icon={<ReloadOutlined />}
+                                  icon={<ReloadOutlined aria-hidden />}
                                   onClick={() =>
                                     methods.setValue('email', RandomUtil.randomLowerAndNum(12))
                                   }
@@ -849,7 +973,7 @@ export default function ClientFormModal({
                             </Space.Compact>
                           </Form.Item>
                         </Col>
-                        <Col xs={24} md={6}>
+                        <Col xs={24} md={12}>
                           <FormField
                             name="totalGB"
                             label={t('pages.clients.totalGB')}
@@ -859,8 +983,9 @@ export default function ClientFormModal({
                             <InputNumber min={0} step={1} style={{ width: '100%' }} />
                           </FormField>
                         </Col>
-                        <Col xs={24} md={6}>
+                        <Col xs={24} md={12}>
                           <Form.Item
+                            htmlFor={`${uid}-limit-ip`}
                             label={t('pages.clients.limitIp')}
                             tooltip={t('pages.clients.limitIpDesc')}
                           >
@@ -868,6 +993,8 @@ export default function ClientFormModal({
                               <span style={{ display: 'flex', width: '100%' }}>
                                 <Space.Compact style={{ display: 'flex', flex: 1 }}>
                                   <InputNumber
+                                    id={`${uid}-limit-ip`}
+                                    aria-describedby={`${uid}-limit-ip-hint`}
                                     value={limitIp}
                                     min={0}
                                     disabled={limitIpDisabled}
@@ -881,7 +1008,7 @@ export default function ClientFormModal({
                                     <Tooltip title={t('pages.clients.ipLog')}>
                                       <Button
                                         aria-label={t('pages.clients.ipLog')}
-                                        icon={<EyeOutlined />}
+                                        icon={<EyeOutlined aria-hidden />}
                                         loading={ipsLoading}
                                         onClick={openIpsModal}
                                       >
@@ -892,15 +1019,21 @@ export default function ClientFormModal({
                                 </Space.Compact>
                               </span>
                             </Tooltip>
+                            <span id={`${uid}-limit-ip-hint`} hidden>
+                              {t('pages.clients.limitIpDesc')}
+                            </span>
                           </Form.Item>
                         </Col>
-                        <Col xs={24} md={6}>
+                        <Col xs={24} md={12}>
                           <Form.Item
+                            htmlFor={`${uid}-limit-hwid`}
                             label={t('pages.clients.limitHwid')}
                             tooltip={t('pages.clients.limitHwidDesc')}
                           >
                             <Space.Compact style={{ display: 'flex' }}>
                               <InputNumber
+                                id={`${uid}-limit-hwid`}
+                                aria-describedby={`${uid}-limit-hwid-hint`}
                                 value={limitHwid}
                                 min={0}
                                 style={{ flex: 1 }}
@@ -910,7 +1043,7 @@ export default function ClientFormModal({
                                 <Tooltip title={t('pages.clients.hwidLog')}>
                                   <Button
                                     aria-label={t('pages.clients.hwidLog')}
-                                    icon={<EyeOutlined />}
+                                    icon={<EyeOutlined aria-hidden />}
                                     loading={hwidsLoading}
                                     onClick={openHwidsModal}
                                   >
@@ -919,6 +1052,9 @@ export default function ClientFormModal({
                                 </Tooltip>
                               )}
                             </Space.Compact>
+                            <span id={`${uid}-limit-hwid-hint`} hidden>
+                              {t('pages.clients.limitHwidDesc')}
+                            </span>
                           </Form.Item>
                         </Col>
                       </Row>
@@ -934,8 +1070,12 @@ export default function ClientFormModal({
                               <InputNumber min={0} style={{ width: '100%' }} />
                             </FormField>
                           ) : (
-                            <Form.Item label={t('pages.clients.expiryTime')}>
+                            <Form.Item
+                              label={t('pages.clients.expiryTime')}
+                              htmlFor={`${uid}-expiry`}
+                            >
                               <DateTimePicker
+                                id={`${uid}-expiry`}
                                 value={expiryDayjs}
                                 onChange={(d) =>
                                   methods.setValue('expiryDate', d ? d.valueOf() : 0)
@@ -945,8 +1085,12 @@ export default function ClientFormModal({
                           )}
                         </Col>
                         <Col xs={12} md={6}>
-                          <Form.Item label={t('pages.clients.delayedStart')}>
+                          <Form.Item
+                            label={t('pages.clients.delayedStart')}
+                            htmlFor={`${uid}-delayed-start`}
+                          >
                             <Switch
+                              id={`${uid}-delayed-start`}
                               checked={delayedStart}
                               onChange={(v) => {
                                 methods.setValue('delayedStart', v);
@@ -956,37 +1100,10 @@ export default function ClientFormModal({
                             />
                           </Form.Item>
                         </Col>
-                        <Col xs={12} md={6}>
-                          <FormField
-                            name="reset"
-                            label={t('pages.clients.renewDays')}
-                            tooltip={t('pages.clients.renewDesc')}
-                            transform={{ output: (v) => Number(v) || 0 }}
-                          >
-                            <InputNumber min={0} style={{ width: '100%' }} />
-                          </FormField>
-                        </Col>
-                        <Col xs={12} md={6}>
-                          <FormField
-                            name="resetDay"
-                            label={t('pages.clients.renewOnDay')}
-                            tooltip={t('pages.clients.renewOnDayDesc')}
-                            transform={{ output: (v) => Number(v) || 0 }}
-                          >
-                            <InputNumber min={0} max={31} style={{ width: '100%' }} />
-                          </FormField>
-                        </Col>
-                        <Col xs={12} md={6}>
-                          <FormField
-                            name="resetMax"
-                            label={t('pages.clients.renewMax')}
-                            tooltip={t('pages.clients.renewMaxDesc')}
-                            transform={{ output: (v) => Number(v) || 0 }}
-                          >
-                            <InputNumber min={0} style={{ width: '100%' }} />
-                          </FormField>
-                        </Col>
-                        <Col xs={12} md={6}>
+                      </Row>
+
+                      <Row gutter={16}>
+                        <Col xs={24} md={12}>
                           <FormField
                             name="trafficReset"
                             label={t('pages.inbounds.periodicTrafficResetTitle')}
@@ -1000,7 +1117,7 @@ export default function ClientFormModal({
                           </FormField>
                         </Col>
                         {trafficReset === 'monthly' && (
-                          <Col xs={12} md={6}>
+                          <Col xs={24} md={12}>
                             <FormField
                               name="trafficResetDay"
                               label={t('pages.inbounds.periodicTrafficResetDay')}
@@ -1011,6 +1128,14 @@ export default function ClientFormModal({
                           </Col>
                         )}
                       </Row>
+
+                      <ClientRenewalFields
+                        active={open}
+                        delayedStart={delayedStart}
+                        expiryTime={delayedStart ? -86400000 * (delayedDays || 0) : expiryDate || 0}
+                        resetCount={client?.traffic?.resetCount || 0}
+                        setExpiry={(expiry) => methods.setValue('expiryDate', expiry)}
+                      />
 
                       <Row gutter={16}>
                         <Col xs={24} md={12}>
@@ -1034,47 +1159,78 @@ export default function ClientFormModal({
                         </Col>
                       </Row>
 
-                      {(tgBotEnable || showReverseTag) && (
+                      <Row gutter={16}>
+                        <Col xs={24} md={12}>
+                          <Form.Item
+                            label={t('pages.clients.hostRuleOverride')}
+                            htmlFor={`${uid}-host-rule-override`}
+                          >
+                            <Select
+                              id={`${uid}-host-rule-override`}
+                              mode="multiple"
+                              tagRender={selectTagRender}
+                              value={clientHostRuleIds || []}
+                              onChange={(v) => methods.setValue('clientHostRuleIds', v)}
+                              options={hostRuleOptions}
+                              placeholder={t('pages.clients.hostRuleOverridePlaceholder')}
+                              placement="topLeft"
+                              listHeight={220}
+                              allowClear
+                              showSearch={{
+                                filterOption: (input, option) =>
+                                  ((option?.label as string) || '')
+                                    .toLowerCase()
+                                    .includes(input.toLowerCase()),
+                              }}
+                            />
+                          </Form.Item>
+                        </Col>
+                        {showReverseTag && (
+                          <Col xs={24} md={12}>
+                            <FormField name="reverseTag" label={t('pages.clients.reverseTag')}>
+                              <Input placeholder={t('pages.clients.reverseTagPlaceholder')} />
+                            </FormField>
+                          </Col>
+                        )}
+                      </Row>
+
+                      {tgBotEnable && (
                         <Row gutter={16}>
-                          {tgBotEnable && (
-                            <Col xs={24} md={12}>
-                              <FormField
-                                name="tgId"
-                                label={t('pages.clients.telegramId')}
-                                transform={{ output: (v) => Number(v) || 0 }}
-                              >
-                                <InputNumber
-                                  min={0}
-                                  controls={false}
-                                  placeholder={t('pages.clients.telegramIdPlaceholder')}
-                                  style={{ width: '100%' }}
-                                />
-                              </FormField>
-                            </Col>
-                          )}
-                          {showReverseTag && (
-                            <Col xs={24} md={12}>
-                              <FormField name="reverseTag" label={t('pages.clients.reverseTag')}>
-                                <Input placeholder={t('pages.clients.reverseTagPlaceholder')} />
-                              </FormField>
-                            </Col>
-                          )}
+                          <Col xs={24} md={12}>
+                            <FormField
+                              name="tgId"
+                              label={t('pages.clients.telegramId')}
+                              transform={{ output: (v) => Number(v) || 0 }}
+                            >
+                              <InputNumber
+                                min={0}
+                                controls={false}
+                                placeholder={t('pages.clients.telegramIdPlaceholder')}
+                                style={{ width: '100%' }}
+                              />
+                            </FormField>
+                          </Col>
                         </Row>
                       )}
 
-                      <Form.Item label={t('pages.clients.attachedInbounds')} required={!isEdit}>
+                      <Form.Item
+                        label={t('pages.clients.attachedInbounds')}
+                        required={!isEdit}
+                        htmlFor={`${uid}-inbounds`}
+                      >
                         <SelectAllClearButtons
                           options={inboundOptions}
                           value={inboundIds}
-                          onChange={(v) => methods.setValue('inboundIds', v)}
+                          onChange={handleInboundChange}
                         />
                         <Select
+                          id={`${uid}-inbounds`}
                           mode="multiple"
+                          tagRender={selectTagRender}
                           value={inboundIds}
-                          onChange={(v) => methods.setValue('inboundIds', v)}
+                          onChange={handleInboundChange}
                           options={inboundOptions}
                           placeholder={t('pages.clients.selectInbound')}
-                          maxTagCount="responsive"
                           placement="topLeft"
                           listHeight={220}
                           showSearch={{
@@ -1102,74 +1258,96 @@ export default function ClientFormModal({
                   label: t('pages.clients.tabCredentials'),
                   children: (
                     <>
-                      <Form.Item label={t('pages.clients.uuid')}>
+                      <Form.Item label={t('pages.clients.uuid')} htmlFor={`${uid}-uuid`}>
                         <Space.Compact style={{ display: 'flex' }}>
                           <Input
+                            id={`${uid}-uuid`}
                             value={uuid}
                             style={{ flex: 1 }}
                             onChange={(e) => methods.setValue('uuid', e.target.value)}
                           />
                           <Button
                             aria-label={t('regenerate')}
-                            icon={<ReloadOutlined />}
+                            icon={<ReloadOutlined aria-hidden />}
                             onClick={() => methods.setValue('uuid', RandomUtil.randomUUID())}
                           />
                         </Space.Compact>
                       </Form.Item>
 
                       <Form.Item
+                        htmlFor={`${uid}-password`}
                         label={t('pages.clients.password')}
                         tooltip={t('pages.clients.passwordDesc')}
                       >
                         <Space.Compact style={{ display: 'flex' }}>
                           <Input
+                            id={`${uid}-password`}
+                            aria-describedby={`${uid}-password-hint`}
                             value={password}
                             style={{ flex: 1 }}
                             onChange={(e) => methods.setValue('password', e.target.value)}
                           />
                           <Button
                             aria-label={t('regenerate')}
-                            icon={<ReloadOutlined />}
+                            icon={<ReloadOutlined aria-hidden />}
                             onClick={regeneratePassword}
                           />
                         </Space.Compact>
+                        <span id={`${uid}-password-hint`} hidden>
+                          {t('pages.clients.passwordDesc')}
+                        </span>
                       </Form.Item>
 
-                      <Form.Item label={t('pages.clients.subId')}>
+                      <Form.Item
+                        htmlFor={`${uid}-sub-id`}
+                        label={t('pages.clients.subId')}
+                        tooltip={t('pages.clients.subIdDesc')}
+                      >
                         <Space.Compact style={{ display: 'flex' }}>
                           <Input
+                            id={`${uid}-sub-id`}
+                            aria-describedby={`${uid}-sub-id-hint`}
                             value={subId}
                             style={{ flex: 1 }}
                             onChange={(e) => methods.setValue('subId', e.target.value)}
                           />
                           <Button
                             aria-label={t('regenerate')}
-                            icon={<ReloadOutlined />}
+                            icon={<ReloadOutlined aria-hidden />}
                             onClick={() =>
                               methods.setValue('subId', RandomUtil.randomLowerAndNum(16))
                             }
                           />
                         </Space.Compact>
+                        <span id={`${uid}-sub-id-hint`} hidden>
+                          {t('pages.clients.subIdDesc')}
+                        </span>
                       </Form.Item>
 
                       <Form.Item
+                        htmlFor={`${uid}-auth`}
                         label={t('pages.clients.hysteriaAuth')}
                         tooltip={t('pages.clients.hysteriaAuthDesc')}
                       >
                         <Space.Compact style={{ display: 'flex' }}>
                           <Input
+                            id={`${uid}-auth`}
+                            aria-describedby={`${uid}-auth-hint`}
                             value={auth}
                             style={{ flex: 1 }}
                             onChange={(e) => methods.setValue('auth', e.target.value)}
                           />
                           <Button
                             aria-label={t('regenerate')}
-                            icon={<ReloadOutlined />}
+                            icon={<ReloadOutlined aria-hidden />}
                             onClick={() =>
                               methods.setValue('auth', RandomUtil.randomLowerAndNum(16))
                             }
                           />
                         </Space.Compact>
+                        <span id={`${uid}-auth-hint`} hidden>
+                          {t('pages.clients.hysteriaAuthDesc')}
+                        </span>
                       </Form.Item>
 
                       {showFlow && (
@@ -1192,6 +1370,7 @@ export default function ClientFormModal({
                       {(showWireguard || showAmneziawg) && (
                         <>
                           <Form.Item
+                            htmlFor={`${uid}-wg-private-key`}
                             label={t(
                               showAmneziawg
                                 ? 'pages.clients.amneziaWgPrivateKey'
@@ -1200,6 +1379,7 @@ export default function ClientFormModal({
                           >
                             <Space.Compact style={{ display: 'flex' }}>
                               <Input
+                                id={`${uid}-wg-private-key`}
                                 value={wgPrivateKey}
                                 style={{ flex: 1 }}
                                 onChange={(e) => {
@@ -1213,7 +1393,7 @@ export default function ClientFormModal({
                               />
                               <Button
                                 aria-label={t('regenerate')}
-                                icon={<ReloadOutlined />}
+                                icon={<ReloadOutlined aria-hidden />}
                                 onClick={regenerateWireguardKeys}
                               />
                             </Space.Compact>
@@ -1228,16 +1408,25 @@ export default function ClientFormModal({
                           >
                             <Input disabled />
                           </FormField>
-                          <FormField
-                            name="wgPreSharedKey"
+                          <Form.Item
+                            htmlFor={`${uid}-wg-psk`}
                             label={t(
                               showAmneziawg
                                 ? 'pages.clients.amneziaWgPreSharedKey'
                                 : 'pages.clients.wireguardPreSharedKey',
                             )}
                           >
-                            <Input />
-                          </FormField>
+                            <Space.Compact style={{ display: 'flex' }}>
+                              <FormField name="wgPreSharedKey" noStyle>
+                                <Input id={`${uid}-wg-psk`} style={{ flex: 1 }} />
+                              </FormField>
+                              <Button
+                                aria-label={t('regenerate')}
+                                icon={<ReloadOutlined aria-hidden />}
+                                onClick={regenerateWireguardPresharedKey}
+                              />
+                            </Space.Compact>
+                          </Form.Item>
                           {showWireguard && showAmneziawg ? (
                             <>
                               <FormField
@@ -1272,6 +1461,38 @@ export default function ClientFormModal({
                               <Input placeholder="10.8.1.2/32" />
                             </FormField>
                           )}
+                          <FormField
+                            name="wgKeepAlive"
+                            label={t('pages.clients.tunnelKeepAlive')}
+                            extra={t(
+                              showAmneziawg && !showWireguard
+                                ? 'pages.clients.amneziaWgKeepAliveHint'
+                                : 'pages.clients.tunnelKeepAliveHint',
+                            )}
+                            transform={{
+                              output:
+                                showAmneziawg && !showWireguard
+                                  ? keepAliveInputValue
+                                  : (value) => Number(value) || 0,
+                            }}
+                            rules={
+                              showAmneziawg
+                                ? {
+                                    validate: rhfZodValidate(
+                                      showWireguard
+                                        ? OptionalNumericKeepAliveInputSchema
+                                        : OptionalAmneziaWGKeepAliveInputSchema,
+                                    ),
+                                  }
+                                : undefined
+                            }
+                          >
+                            {showAmneziawg && !showWireguard ? (
+                              <Input placeholder="25" />
+                            ) : (
+                              <InputNumber min={0} max={65535} style={{ width: '100%' }} />
+                            )}
+                          </FormField>
                           {showAmneziawg && (
                             <FormField
                               name="awgForwardedPorts"
@@ -1286,18 +1507,20 @@ export default function ClientFormModal({
                       {showMtproto && (
                         <>
                           <Form.Item
+                            htmlFor={`${uid}-mtproto-secret`}
                             label={t('pages.clients.mtprotoSecret')}
                             extra={t('pages.clients.mtprotoSecretHint')}
                           >
                             <Space.Compact style={{ display: 'flex' }}>
                               <Input
+                                id={`${uid}-mtproto-secret`}
                                 value={secret}
                                 style={{ flex: 1 }}
                                 onChange={(e) => methods.setValue('secret', e.target.value)}
                               />
                               <Button
                                 aria-label={t('regenerate')}
-                                icon={<ReloadOutlined />}
+                                icon={<ReloadOutlined aria-hidden />}
                                 onClick={regenerateMtprotoSecret}
                               />
                             </Space.Compact>
@@ -1325,7 +1548,7 @@ export default function ClientFormModal({
 
                       <Button
                         type="primary"
-                        icon={<PlusOutlined />}
+                        icon={<PlusOutlined aria-hidden />}
                         onClick={() => addExternalLinkRow('link')}
                       >
                         {t('pages.clients.addExternalLink')}
@@ -1345,7 +1568,7 @@ export default function ClientFormModal({
                                     valueProp="checked"
                                     noStyle
                                   >
-                                    <Switch size="small" />
+                                    <Switch size="small" aria-label={t('enable')} />
                                   </FormField>
                                   <span>{t('enable')}</span>
                                 </div>
@@ -1359,7 +1582,7 @@ export default function ClientFormModal({
                                   <Button
                                     aria-label={t('delete')}
                                     danger
-                                    icon={<DeleteOutlined />}
+                                    icon={<DeleteOutlined aria-hidden />}
                                     onClick={() => removeExternalLink(index)}
                                   />
                                 </Tooltip>
@@ -1379,6 +1602,7 @@ export default function ClientFormModal({
                                     const hasSpecificExpiry = Number(expiryField.value) > 0;
                                     return (
                                       <DateTimePicker
+                                        aria-label={t('pages.clients.expiryTime')}
                                         value={displayedExpiry > 0 ? dayjs(displayedExpiry) : null}
                                         onChange={(v) => expiryField.onChange(v ? v.valueOf() : 0)}
                                         placeholder={t('pages.inbounds.leaveBlankToNeverExpire')}
@@ -1396,7 +1620,7 @@ export default function ClientFormModal({
 
                       <Button
                         type="primary"
-                        icon={<PlusOutlined />}
+                        icon={<PlusOutlined aria-hidden />}
                         onClick={() => addExternalLinkRow('subscription')}
                       >
                         {t('pages.clients.addExternalSubscription')}
@@ -1416,7 +1640,7 @@ export default function ClientFormModal({
                                     valueProp="checked"
                                     noStyle
                                   >
-                                    <Switch size="small" />
+                                    <Switch size="small" aria-label={t('enable')} />
                                   </FormField>
                                   <span>{t('enable')}</span>
                                 </div>
@@ -1430,7 +1654,7 @@ export default function ClientFormModal({
                                   <Button
                                     aria-label={t('delete')}
                                     danger
-                                    icon={<DeleteOutlined />}
+                                    icon={<DeleteOutlined aria-hidden />}
                                     onClick={() => removeExternalLink(index)}
                                   />
                                 </Tooltip>
@@ -1456,6 +1680,7 @@ export default function ClientFormModal({
                                     const hasSpecificExpiry = Number(expiryField.value) > 0;
                                     return (
                                       <DateTimePicker
+                                        aria-label={t('pages.clients.expiryTime')}
                                         value={displayedExpiry > 0 ? dayjs(displayedExpiry) : null}
                                         onChange={(v) => expiryField.onChange(v ? v.valueOf() : 0)}
                                         placeholder={t('pages.inbounds.leaveBlankToNeverExpire')}
@@ -1496,7 +1721,12 @@ export default function ClientFormModal({
         zIndex={CLIENT_IP_LOG_MODAL_Z_INDEX}
         onCancel={() => setIpsModalOpen(false)}
         footer={[
-          <Button key="refresh" icon={<ReloadOutlined />} loading={ipsLoading} onClick={loadIps}>
+          <Button
+            key="refresh"
+            icon={<ReloadOutlined aria-hidden />}
+            loading={ipsLoading}
+            onClick={loadIps}
+          >
             {t('refresh')}
           </Button>,
           <Button

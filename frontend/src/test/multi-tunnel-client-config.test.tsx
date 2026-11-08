@@ -1,9 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { screen } from '@testing-library/react';
-
+import { MemoryRouter } from 'react-router';
 import ClientInfoModal from '@/pages/clients/ClientInfoModal';
 import ClientQrModal from '@/pages/clients/ClientQrModal';
 import type { ClientRecord, InboundOption } from '@/hooks/useClients';
+import type { HostRecord } from '@/schemas/api/host';
 import { renderWithProviders } from './test-utils';
 
 const deAwgInbound: InboundOption = {
@@ -168,16 +169,99 @@ describe('Multi-tunnel Client Modals', () => {
 
   it('renders separate collapse panels in ClientQrModal for multiple AmneziaWG inbounds', () => {
     renderWithProviders(
-      <ClientQrModal
-        open
-        client={multiAwgClient}
-        inboundsById={{ 101: deAwgInbound, 102: fiAwgInbound }}
-        tunnelAllowedIPs={{ 101: '10.8.1.5/32', 102: '10.8.2.10/32' }}
-        onOpenChange={() => {}}
-      />,
+      <MemoryRouter initialEntries={['/clients']}>
+        <ClientQrModal
+          open
+          client={multiAwgClient}
+          inboundsById={{ 101: deAwgInbound, 102: fiAwgInbound }}
+          tunnelAllowedIPs={{ 101: '10.8.1.5/32', 102: '10.8.2.10/32' }}
+          onOpenChange={() => {}}
+        />
+      </MemoryRouter>,
     );
 
     expect(screen.getByText('DE · Kelsterbach')).toBeTruthy();
     expect(screen.getByText('FI · Helsinki')).toBeTruthy();
+  });
+
+  // The subscription beside these configs advertises the inbound's Hosts, so
+  // the panel-built configs must too — one per Host address.
+  const edgeHosts: HostRecord[] = [
+    {
+      groupId: 'cdn',
+      inboundIds: [201],
+      hosts: ['edge.example.com:443', 'edge2.example.com'],
+      remark: 'CDN',
+    },
+  ];
+  const edgeClient = { ...multiWgClient, inboundIds: [201] } as ClientRecord;
+  const edgeLabels = [
+    'US · New York - edge.example.com:443',
+    'US · New York - edge2.example.com:51820',
+  ];
+
+  it('renders one ConfigBlock per Host in ClientInfoModal', () => {
+    renderWithProviders(
+      <ClientInfoModal
+        open
+        client={edgeClient}
+        inboundsById={{ 201: usWgInbound }}
+        isOnline={false}
+        hosts={edgeHosts}
+        onOpenChange={() => {}}
+      />,
+    );
+
+    for (const label of edgeLabels) expect(screen.getByText(label)).toBeTruthy();
+  });
+
+  it('renders one collapse panel per Host in ClientQrModal', () => {
+    renderWithProviders(
+      <MemoryRouter initialEntries={['/clients']}>
+        <ClientQrModal
+          open
+          client={edgeClient}
+          inboundsById={{ 201: usWgInbound }}
+          hosts={edgeHosts}
+          onOpenChange={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    for (const label of edgeLabels) expect(screen.getByText(label)).toBeTruthy();
+  });
+
+  it('builds the TUIC Clash config only from Hosts the Clash subscription serves', () => {
+    const tuicInbound = { id: 301, remark: 'tuic', protocol: 'tuic', port: 8443 } as InboundOption;
+    const tuicClient = {
+      id: 'c4',
+      email: 'TUIC-CLIENT',
+      uuid: 'e79b9107-1607-4e6c-a496-d8f99e4f0dc5',
+      password: 'secret',
+      inboundIds: [301],
+    } as unknown as ClientRecord;
+    const hosts: HostRecord[] = [
+      { groupId: 'clash', inboundIds: [301], hosts: ['clash.example.com:443'] },
+      {
+        groupId: 'raw-only',
+        inboundIds: [301],
+        hosts: ['raw.example.com:443'],
+        excludeFromSubTypes: ['clash'],
+      },
+    ];
+    renderWithProviders(
+      <MemoryRouter initialEntries={['/clients']}>
+        <ClientQrModal
+          open
+          client={tuicClient}
+          inboundsById={{ 301: tuicInbound }}
+          hosts={hosts}
+          onOpenChange={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getAllByText('TUIC config (Clash)')).toHaveLength(1);
+    expect(screen.queryByText('raw.example.com:443')).toBeNull();
   });
 });

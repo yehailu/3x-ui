@@ -1,6 +1,17 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Form, Input, InputNumber, Modal, Select, Switch, Tabs, message } from 'antd';
+import {
+  Alert,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Select,
+  Switch,
+  Tabs,
+  Typography,
+  message,
+} from 'antd';
 import {
   ProfileOutlined,
   SafetyCertificateOutlined,
@@ -17,6 +28,8 @@ import type { HostRecord } from '@/api/queries/useHostsQuery';
 import { BulkAddHostSchema, type BulkAddHostValues } from '@/schemas/api/host';
 import type { InboundOption } from '@/schemas/client';
 import { ALPN_OPTION, UTLS_FINGERPRINT } from '@/schemas/primitives';
+import { CipherSuitesSelect, selectTagRender } from '@/components/form';
+import DynamicEchHelper from '@/components/form/DynamicEchHelper';
 import { FormField, rhfZodValidate } from '@/components/form/rhf';
 import { useNodesQuery } from '@/api/queries/useNodesQuery';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
@@ -40,6 +53,13 @@ interface HostFormModalProps {
 const asString = (v: unknown): string => (typeof v === 'string' ? v : '');
 
 function defaultsFor(host: HostRecord | null): FormShape {
+  const initialSnis =
+    host?.snis && host.snis.length > 0
+      ? host.snis.filter((s) => s && s.trim() !== '')
+      : host?.sni && host.sni.trim() !== ''
+        ? [host.sni.trim()]
+        : [];
+
   return {
     inboundIds: host?.inboundIds ?? [],
     hosts: (host?.hosts || []).filter((h) => h && h.trim() !== ''),
@@ -50,12 +70,15 @@ function defaultsFor(host: HostRecord | null): FormShape {
     isHidden: host?.isHidden ?? false,
     tags: host?.tags ?? [],
     port: host?.port ?? 0,
-    security: (host?.security as BulkAddHostValues['security']) ?? 'same',
+    security: host?.security ? (host.security as BulkAddHostValues['security']) : 'same',
     sni: host?.sni ?? '',
+    snis: initialSnis,
+    sniSharedRandom: initialSnis.length > 1 && (host?.sniSharedRandom ?? false),
     hostHeader: host?.hostHeader ?? '',
     path: host?.path ?? '',
     alpn: (host?.alpn as BulkAddHostValues['alpn']) ?? [],
     fingerprint: host?.fingerprint as BulkAddHostValues['fingerprint'],
+    cipherSuites: host?.cipherSuites ?? '',
     overrideSniFromAddress: host?.overrideSniFromAddress ?? false,
     keepSniBlank: host?.keepSniBlank ?? false,
     pinnedPeerCertSha256: host?.pinnedPeerCertSha256 ?? [],
@@ -72,6 +95,7 @@ function defaultsFor(host: HostRecord | null): FormShape {
     mihomoIpVersion: host?.mihomoIpVersion as BulkAddHostValues['mihomoIpVersion'],
     mihomoX25519: host?.mihomoX25519 ?? false,
     shuffleHost: host?.shuffleHost ?? false,
+    randomCount: host?.randomCount ?? 1,
   };
 }
 
@@ -91,8 +115,20 @@ export default function HostFormModal({
   const [loading, setLoading] = useState(false);
 
   const security = (useWatch({ control: methods.control, name: 'security' }) ?? 'same') as string;
-  const showTls = security === 'tls' || security === 'reality';
-  const showTlsExtras = security === 'tls';
+  const fingerprint = (useWatch({ control: methods.control, name: 'fingerprint' }) ?? '') as string;
+  const watchedSnis = useWatch({ control: methods.control, name: 'snis' });
+  const hasMultipleSnis = Boolean(
+    watchedSnis && watchedSnis.filter((s) => typeof s === 'string' && s.trim() !== '').length > 1,
+  );
+
+  const watchedSingleSni = useWatch({ control: methods.control, name: 'sni' }) ?? '';
+  const hostSni = (watchedSnis && watchedSnis.length > 0 ? watchedSnis[0] : '') || watchedSingleSni;
+  const hostEchConfig = useWatch({ control: methods.control, name: 'echConfigList' }) ?? '';
+  const showTls = security === 'tls' || security === 'reality' || security === 'same';
+  const showTlsExtras = security === 'tls' || security === 'same';
+  const isCipherSuitesEnabled = showTlsExtras && (!fingerprint || fingerprint === 'unsafe');
+  const watchedHosts = useWatch({ control: methods.control, name: 'hosts' });
+  const hasCidr = Boolean(watchedHosts?.some((h) => typeof h === 'string' && h.includes('/')));
 
   // React resets this during render rather than in an effect so the modal's
   // first open frame already shows cleared fields.
@@ -152,13 +188,33 @@ export default function HostFormModal({
     return Array.from(addresses).map((addr) => ({ value: addr, label: addr }));
   }, [existingHosts]);
 
+  const sniOptions = useMemo(() => {
+    const snis = new Set<string>();
+    for (const h of existingHosts || []) {
+      if (h.snis) {
+        for (const s of h.snis) {
+          if (s && s.trim() !== '') snis.add(s.trim());
+        }
+      }
+      if (h.sni && h.sni.trim() !== '') {
+        snis.add(h.sni.trim());
+      }
+    }
+    return Array.from(snis).map((s) => ({ value: s, label: s }));
+  }, [existingHosts]);
+
   const onFinish = async (values: FormShape) => {
     if (loading) return;
     const { enable, ...rest } = values;
     const isDisabled = !enable;
+    const cleanedSnis = (rest.snis || []).map((s) => s.trim()).filter(Boolean);
+    const primarySni = cleanedSnis.length > 0 ? cleanedSnis[0] : rest.sni || '';
     const payload: BulkAddHostValues = {
       ...rest,
       hosts: (rest.hosts || []).filter((h) => h && h.trim() !== ''),
+      sni: primarySni,
+      snis: cleanedSnis,
+      sniSharedRandom: cleanedSnis.length > 1 && Boolean(rest.sniSharedRandom),
       isDisabled,
     };
     setLoading(true);
@@ -206,7 +262,11 @@ export default function HostFormModal({
               {
                 key: 'basic',
                 forceRender: true,
-                label: catTabLabel(<ProfileOutlined />, t('pages.hosts.sections.basic'), isMobile),
+                label: catTabLabel(
+                  <ProfileOutlined aria-hidden />,
+                  t('pages.hosts.sections.basic'),
+                  isMobile,
+                ),
                 children: (
                   <>
                     <FormField
@@ -231,6 +291,7 @@ export default function HostFormModal({
                     >
                       <Select
                         mode="multiple"
+                        tagRender={selectTagRender}
                         options={inboundSelectOptions}
                         showSearch={{ optionFilterProp: 'label' }}
                         placeholder={t('pages.hosts.selectInbound')}
@@ -244,11 +305,17 @@ export default function HostFormModal({
                     >
                       <Select
                         mode="tags"
+                        tagRender={selectTagRender}
                         options={hostOptions}
                         tokenSeparators={[',', ';', ' ']}
                         placeholder="cdn.example.com, cdn2.example.com:443"
                       />
                     </FormField>
+                    {hasCidr && (
+                      <FormField name="randomCount" label={t('pages.hosts.fields.randomCount')}>
+                        <InputNumber min={1} max={100} style={{ width: '100%' }} />
+                      </FormField>
+                    )}
                     <FormField
                       name="port"
                       label={t('pages.hosts.fields.port')}
@@ -261,7 +328,12 @@ export default function HostFormModal({
                       label={t('pages.hosts.fields.tags')}
                       tooltip={t('pages.hosts.hints.tags')}
                     >
-                      <Select mode="tags" allowClear tokenSeparators={[',']} />
+                      <Select
+                        mode="tags"
+                        tagRender={selectTagRender}
+                        allowClear
+                        tokenSeparators={[',']}
+                      />
                     </FormField>
                     <FormField
                       name="nodeGuids"
@@ -270,6 +342,7 @@ export default function HostFormModal({
                     >
                       <Select
                         mode="multiple"
+                        tagRender={selectTagRender}
                         allowClear
                         options={nodeSelectOptions}
                         showSearch={{ optionFilterProp: 'label' }}
@@ -289,7 +362,7 @@ export default function HostFormModal({
                 key: 'security',
                 forceRender: true,
                 label: catTabLabel(
-                  <SafetyCertificateOutlined />,
+                  <SafetyCertificateOutlined aria-hidden />,
                   t('pages.hosts.sections.security'),
                   isMobile,
                 ),
@@ -305,9 +378,28 @@ export default function HostFormModal({
                     </FormField>
                     {showTls && (
                       <>
-                        <FormField name="sni" label={t('pages.hosts.fields.sni')}>
-                          <Input />
+                        <FormField
+                          name="snis"
+                          label={t('pages.hosts.fields.sni')}
+                          rules={{ validate: rhfZodValidate(BulkAddHostSchema.shape.snis) }}
+                        >
+                          <Select
+                            mode="tags"
+                            tagRender={selectTagRender}
+                            options={sniOptions}
+                            tokenSeparators={[',', ';', ' ']}
+                            placeholder="sni.example.com, sni2.example.com"
+                          />
                         </FormField>
+                        {hasMultipleSnis && (
+                          <FormField
+                            name="sniSharedRandom"
+                            label={t('pages.hosts.fields.sniSharedRandom')}
+                            valueProp="checked"
+                          >
+                            <Switch />
+                          </FormField>
+                        )}
                         <FormField
                           name="overrideSniFromAddress"
                           label={t('pages.hosts.fields.overrideSniFromAddress')}
@@ -330,10 +422,29 @@ export default function HostFormModal({
                     {showTlsExtras && (
                       <>
                         <FormField name="alpn" label={t('pages.hosts.fields.alpn')}>
-                          <Select mode="multiple" allowClear options={alpnOptions} />
+                          <Select
+                            mode="multiple"
+                            tagRender={selectTagRender}
+                            allowClear
+                            options={alpnOptions}
+                          />
+                        </FormField>
+                        <FormField
+                          name="cipherSuites"
+                          label={t('pages.inbounds.form.cipherSuites')}
+                        >
+                          <CipherSuitesSelect
+                            disabled={!isCipherSuitesEnabled}
+                            placeholder={t('pages.inbounds.form.autoOption')}
+                          />
                         </FormField>
                         <FormField name="pinnedPeerCertSha256" label={t('pages.hosts.fields.pins')}>
-                          <Select mode="tags" allowClear tokenSeparators={[',']} />
+                          <Select
+                            mode="tags"
+                            tagRender={selectTagRender}
+                            allowClear
+                            tokenSeparators={[',']}
+                          />
                         </FormField>
                         <FormField
                           name="verifyPeerCertByName"
@@ -352,10 +463,34 @@ export default function HostFormModal({
                         </FormField>
                         <FormField
                           name="echConfigList"
-                          label={t('pages.hosts.fields.echConfigList')}
+                          label={t('pages.inbounds.form.echConfigList')}
+                          extra={
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {t('pages.inbounds.form.echConfigListHint')}
+                            </Typography.Text>
+                          }
                         >
-                          <Input.TextArea rows={2} />
+                          <Input.TextArea
+                            rows={2}
+                            placeholder={t('pages.inbounds.form.echDynamicPlaceholder')}
+                          />
                         </FormField>
+                        <Form.Item label=" " style={{ marginBottom: 8 }}>
+                          <DynamicEchHelper
+                            value={hostEchConfig}
+                            sni={hostSni}
+                            onApply={(next) =>
+                              methods.setValue('echConfigList', next, { shouldDirty: true })
+                            }
+                          />
+                        </Form.Item>
+                        <Alert
+                          type="info"
+                          showIcon
+                          data-testid="ech-cdn-warning"
+                          title={t('pages.inbounds.form.echCdnWarningTitle')}
+                          description={t('pages.inbounds.form.echCdnWarningBody')}
+                        />
                       </>
                     )}
                   </>
@@ -365,7 +500,7 @@ export default function HostFormModal({
                 key: 'advanced',
                 forceRender: true,
                 label: catTabLabel(
-                  <ControlOutlined />,
+                  <ControlOutlined aria-hidden />,
                   t('pages.hosts.sections.advanced'),
                   isMobile,
                 ),
@@ -378,7 +513,7 @@ export default function HostFormModal({
                         key: 'adv-general',
                         forceRender: true,
                         label: catTabLabel(
-                          <SettingOutlined />,
+                          <SettingOutlined aria-hidden />,
                           t('pages.hosts.sections.general'),
                           isMobile,
                         ),
@@ -403,6 +538,7 @@ export default function HostFormModal({
                             >
                               <Select
                                 mode="multiple"
+                                tagRender={selectTagRender}
                                 allowClear
                                 options={['raw', 'json', 'clash'].map((v) => ({
                                   value: v,
@@ -417,7 +553,7 @@ export default function HostFormModal({
                         key: 'adv-mux',
                         forceRender: true,
                         label: catTabLabel(
-                          <PartitionOutlined />,
+                          <PartitionOutlined aria-hidden />,
                           t('pages.hosts.fields.muxParams'),
                           isMobile,
                         ),
@@ -437,7 +573,7 @@ export default function HostFormModal({
                         key: 'adv-sockopt',
                         forceRender: true,
                         label: catTabLabel(
-                          <DeploymentUnitOutlined />,
+                          <DeploymentUnitOutlined aria-hidden />,
                           t('pages.hosts.fields.sockoptParams'),
                           isMobile,
                         ),
@@ -457,7 +593,7 @@ export default function HostFormModal({
                         key: 'adv-finalmask',
                         forceRender: true,
                         label: catTabLabel(
-                          <RocketOutlined />,
+                          <RocketOutlined aria-hidden />,
                           t('pages.hosts.fields.finalMask'),
                           isMobile,
                         ),
@@ -481,7 +617,7 @@ export default function HostFormModal({
                 key: 'clash',
                 forceRender: true,
                 label: catTabLabel(
-                  <NodeIndexOutlined />,
+                  <NodeIndexOutlined aria-hidden />,
                   t('pages.hosts.sections.clash'),
                   isMobile,
                 ),
@@ -501,6 +637,7 @@ export default function HostFormModal({
                     <FormField
                       name="mihomoX25519"
                       label={t('pages.hosts.fields.mihomoX25519')}
+                      tooltip={t('pages.hosts.hints.mihomoX25519')}
                       valueProp="checked"
                     >
                       <Switch />

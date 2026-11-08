@@ -157,9 +157,9 @@ func TestListPagedFilters(t *testing.T) {
 			want:   []string{"charlie@x", "delta@x", "foxtrot@x"},
 		},
 		{
-			name:   "deactive bucket is every disabled client",
+			name:   "deactive bucket leaves a disabled client that ran out to depleted",
 			params: ClientPageParams{PageSize: 50, Filter: "deactive"},
-			want:   []string{"echo@x", "foxtrot@x"},
+			want:   []string{"echo@x"},
 		},
 		{
 			name:   "expiring bucket covers near expiry and near quota",
@@ -167,9 +167,9 @@ func TestListPagedFilters(t *testing.T) {
 			want:   []string{"golf@x", "hotel@x"},
 		},
 		{
-			name:   "active bucket keeps enabled clients that still have room",
+			name:   "active bucket leaves clients near depletion to expiring",
 			params: ClientPageParams{PageSize: 50, Filter: "active"},
-			want:   []string{"alpha@x", "bravo@x", "golf@x", "hotel@x", "india@x", "juliet@x", "kilo_1@x", "kilo1@x"},
+			want:   []string{"alpha@x", "bravo@x", "india@x", "juliet@x", "kilo_1@x", "kilo1@x"},
 		},
 		{
 			name:   "buckets are ORed",
@@ -477,6 +477,19 @@ func TestListPagedSummary(t *testing.T) {
 		}
 	})
 
+	t.Run("clicking a stat card filters to exactly the clients it counts", func(t *testing.T) {
+		cards := map[string]int{"active": s.Active, "depleted": s.DepletedCount, "expiring": s.ExpiringCount, "deactive": s.DeactiveCount}
+		for bucket, count := range cards {
+			page, err := svc.ListPaged(inboundSvc, settingSvc, ClientPageParams{PageSize: 50, Filter: bucket})
+			if err != nil {
+				t.Fatalf("ListPaged(%s): %v", bucket, err)
+			}
+			if page.Filtered != count {
+				t.Fatalf("filter %q matched %d clients, card counts %d", bucket, page.Filtered, count)
+			}
+		}
+	})
+
 	t.Run("bucket lists carry the matching emails", func(t *testing.T) {
 		if want := []string{"charlie@x", "delta@x", "foxtrot@x"}; !slices.Equal(s.Depleted, want) {
 			t.Fatalf("depleted = %v, want %v", s.Depleted, want)
@@ -620,5 +633,38 @@ func TestListPagedEmptyPanel(t *testing.T) {
 	}
 	if resp.Groups == nil {
 		t.Fatal("groups = nil, want an empty list so the filter drawer renders")
+	}
+}
+
+// SQLite's LOWER() folds ASCII only, so non-ASCII capitals must still match.
+func TestListPagedNonASCIICase(t *testing.T) {
+	svc, inboundSvc, settingSvc := setupPagingServices(t)
+	rec := model.ClientRecord{Email: "lima@x", Comment: "Привет", Group: "Тест", Enable: true}
+	if err := database.GetDB().Create(&rec).Error; err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	for name, params := range map[string]ClientPageParams{
+		"group":             {PageSize: 50, Group: "Тест"},
+		"group other case":  {PageSize: 50, Group: "ТЕСТ"},
+		"search":            {PageSize: 50, Search: "Привет"},
+		"search lower case": {PageSize: 50, Search: "привет"},
+		"search upper case": {PageSize: 50, Search: "ПРИВЕТ"},
+	} {
+		resp, err := svc.ListPaged(inboundSvc, settingSvc, params)
+		if err != nil {
+			t.Fatalf("%s: ListPaged: %v", name, err)
+		}
+		if got := pagedEmails(resp.Items); !slices.Equal(got, []string{"lima@x"}) {
+			t.Fatalf("%s: emails = %v, want [lima@x]", name, got)
+		}
+	}
+}
+
+func TestCaseVariants(t *testing.T) {
+	if got, want := caseVariants("пРИвет"), []string{"привет", "пРИвет", "ПРИВЕТ", "Привет"}; !slices.Equal(got, want) {
+		t.Fatalf("caseVariants = %v, want %v", got, want)
+	}
+	if got := caseVariants("abc"); !slices.Equal(got, []string{"abc", "ABC", "Abc"}) {
+		t.Fatalf("ASCII variants = %v", got)
 	}
 }

@@ -3,7 +3,11 @@ import { cleanup } from '@testing-library/react';
 import i18next from 'i18next';
 import { initReactI18next } from 'react-i18next';
 
+import { INTERPOLATION } from '@/i18n/react';
 import enUS from '../../../internal/web/translation/en-US.json';
+
+// RTL sets this from a global beforeAll, which never runs with `globals: false`.
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 vi.mock('persian-calendar-suite', () => ({
   PersianDateTimePicker: () => null,
@@ -72,7 +76,7 @@ if (!i18next.isInitialized) {
     lng: 'en-US',
     fallbackLng: 'en-US',
     resources: { 'en-US': { translation: enUS } },
-    interpolation: { escapeValue: false, prefix: '{', suffix: '}' },
+    interpolation: INTERPOLATION,
     returnNull: false,
   });
 }
@@ -92,12 +96,23 @@ afterEach(async () => {
   for (let i = 0; i < 3; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+  /*
+   * AntD Form debounces clearing its error list by 10ms (useDebounce via
+   * rc-util useDelayState), and that timer survives unmount. Wait past it so
+   * it fires while `window` still exists.
+   */
+  await new Promise((resolve) => setTimeout(resolve, 20));
 });
 
 import { HttpUtil, Msg } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 vi.spyOn(HttpUtil, 'post').mockResolvedValue({ success: true, obj: {} } as any);
-vi.spyOn(HttpUtil, 'get').mockImplementation(
-  async (url: string) => new Msg(true, '', url.includes('/panel/api/inbounds/options') ? [] : {}),
-);
+// Array-returning endpoints must resolve to [] so Zod list schemas validate.
+vi.spyOn(HttpUtil, 'get').mockImplementation(async (url: string) => {
+  const isList =
+    url.includes('/panel/api/inbounds/options') ||
+    url.includes('/panel/api/hosts/') ||
+    url.endsWith('/fallbacks');
+  return new Msg(true, '', isList ? [] : {});
+});

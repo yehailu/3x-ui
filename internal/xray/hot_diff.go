@@ -3,6 +3,7 @@ package xray
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/json_util"
@@ -13,13 +14,23 @@ import (
 // process. It only covers the sections Xray can reload at runtime: inbounds,
 // outbounds and routing rules/balancers.
 type HotDiff struct {
-	RemovedInboundTags  []string
-	AddedInbounds       [][]byte
-	RemovedUsers        []UserOp
-	AddedUsers          []UserOp
+	TuicRelayChanges   []InboundReplacement
+	RemovedInboundTags []string
+	AddedInbounds      [][]byte
+	RemovedUsers       []UserOp
+	AddedUsers         []UserOp
+	// DroppedClients are emails an inbound that survives the change stopped
+	// serving, including the protocols diffInboundUsers will not diff.
+	DroppedClients      []UserOp
 	RemovedOutboundTags []string
 	AddedOutbounds      [][]byte
 	RoutingConfig       []byte // full new routing section; nil when unchanged
+}
+
+// InboundReplacement is verified independently of ordinary hot changes.
+type InboundReplacement struct {
+	Previous *InboundConfig
+	Next     *InboundConfig
 }
 
 // UserOp is a per-user AlterInbound operation; User is nil for removals.
@@ -30,9 +41,30 @@ type UserOp struct {
 	User     map[string]any
 }
 
+// DropsUsers reports users removed without being re-added under the same tag:
+// a disable or a delete, where an edit re-adds the email with new values.
+func (d *HotDiff) DropsUsers() bool {
+	if len(d.DroppedClients) > 0 {
+		return true
+	}
+	if len(d.RemovedUsers) == 0 {
+		return false
+	}
+	readded := make(map[string]struct{}, len(d.AddedUsers))
+	for _, u := range d.AddedUsers {
+		readded[u.Tag+"\x00"+u.Email] = struct{}{}
+	}
+	for _, u := range d.RemovedUsers {
+		if _, ok := readded[u.Tag+"\x00"+u.Email]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Empty reports whether the diff contains no operations.
 func (d *HotDiff) Empty() bool {
-	return len(d.RemovedInboundTags) == 0 &&
+	return len(d.TuicRelayChanges) == 0 && len(d.RemovedInboundTags) == 0 &&
 		len(d.AddedInbounds) == 0 &&
 		len(d.RemovedUsers) == 0 &&
 		len(d.AddedUsers) == 0 &&
@@ -121,9 +153,16 @@ func diffInbounds(oldCfg, newCfg *Config, diff *HotDiff) bool {
 		if oldIb.Tag == apiTag || oldIb.Tag == "api" {
 			return false
 		}
+		if oldIb.TuicRelay && (!exists || newIb.TuicRelay) {
+			diff.TuicRelayChanges = append(diff.TuicRelayChanges, InboundReplacement{Previous: oldIb, Next: newIb})
+			continue
+		}
 		if exists && (inboundHasReverseClient(oldIb) || inboundHasReverseClient(newIb)) {
 			logger.Debug("hot diff: inbound [", oldIb.Tag, "] carries a reverse-tagged client, forcing a full restart instead of a hot swap")
 			return false
+		}
+		if exists && !oldIb.TuicRelay {
+			diff.DroppedClients = append(diff.DroppedClients, droppedClients(oldIb, newIb)...)
 		}
 		if exists && diffInboundUsers(oldIb, newIb, diff) {
 			continue
@@ -137,7 +176,7 @@ func diffInbounds(oldCfg, newCfg *Config, diff *HotDiff) bool {
 			return false
 		}
 		if exists && (inboundUsesSocksAccounts(oldIb) || inboundUsesSocksAccounts(newIb)) {
-			logger.Debug("hot diff: inbound [", oldIb.Tag, "] is a password-auth SOCKS5 inbound (e.g. internal/amneziawgnet's per-peer relay); a gRPC remove+add reports success but was observed in production to silently drop an account, forcing a full restart instead of a hot swap")
+			logger.Debug("hot diff: inbound [", oldIb.Tag, "] is a password-auth SOCKS5 inbound (e.g. TUIC or AmneziaWG relay); a gRPC remove+add reports success but was observed in production to silently drop an account, forcing a full restart instead of a hot swap")
 			return false
 		}
 		diff.RemovedInboundTags = append(diff.RemovedInboundTags, oldIb.Tag)
@@ -157,12 +196,16 @@ func diffInbounds(oldCfg, newCfg *Config, diff *HotDiff) bool {
 		if newIb.Tag == apiTag || newIb.Tag == "api" {
 			return false
 		}
+		if newIb.TuicRelay {
+			diff.TuicRelayChanges = append(diff.TuicRelayChanges, InboundReplacement{Next: newIb})
+			continue
+		}
 		if inboundUsesTproxy(newIb) {
 			logger.Debug("hot diff: new inbound [", newIb.Tag, "] is a TPROXY target (e.g. internal/amneziawg's Xray egress bridge); a gRPC add reports success but does not reliably bind a working listener, forcing a full restart instead of a hot add")
 			return false
 		}
 		if inboundUsesSocksAccounts(newIb) {
-			logger.Debug("hot diff: new inbound [", newIb.Tag, "] is a password-auth SOCKS5 inbound (e.g. internal/amneziawgnet's per-peer relay); forcing a full restart instead of a hot add, same reasoning as the existing-inbound case above")
+			logger.Debug("hot diff: new inbound [", newIb.Tag, "] is a password-auth SOCKS5 inbound (e.g. TUIC or AmneziaWG relay); forcing a full restart instead of a hot add, same reasoning as the existing-inbound case above")
 			return false
 		}
 		raw, err := json.Marshal(newIb)
@@ -174,7 +217,40 @@ func diffInbounds(oldCfg, newCfg *Config, diff *HotDiff) bool {
 	return true
 }
 
-var userDiffableProtocols = map[string]struct{}{"vless": {}, "vmess": {}, "trojan": {}}
+// droppedClients lists the emails an inbound present in both configs stopped
+// serving, whatever its protocol: settings.clients is the shape they all share.
+func droppedClients(oldIb, newIb *InboundConfig) []UserOp {
+	oldClients, _, ok := splitSettingsClients(oldIb.Settings)
+	if !ok {
+		return nil
+	}
+	newClients, _, ok := splitSettingsClients(newIb.Settings)
+	if !ok {
+		return nil
+	}
+	var dropped []UserOp
+	for email := range oldClients {
+		if _, still := newClients[email]; !still {
+			dropped = append(dropped, UserOp{Tag: newIb.Tag, Protocol: newIb.Protocol, Email: email})
+		}
+	}
+	return dropped
+}
+
+// InboundUserOps returns the per-user ops that bring a running inbound from oldIb
+// to newIb; ok is false when only rebuilding its handler can apply the change.
+func InboundUserOps(oldIb, newIb *InboundConfig) (*HotDiff, bool) {
+	diff := &HotDiff{}
+	if inboundEqualNormalized(oldIb, newIb) {
+		return diff, true
+	}
+	if !diffInboundUsers(oldIb, newIb, diff) {
+		return nil, false
+	}
+	return diff, true
+}
+
+var userDiffableProtocols = map[string]struct{}{"vless": {}, "vmess": {}, "trojan": {}, "hysteria": {}, "masque": {}, "shadowsocks": {}}
 
 // diffInboundUsers emits per-user AlterInbound ops when two same-tag inbounds
 // differ only in settings.clients, so the handler (and its listener) survives.
@@ -201,6 +277,10 @@ func diffInboundUsers(oldIb, newIb *InboundConfig, diff *HotDiff) bool {
 	if !bytes.Equal(oldRest, newRest) {
 		return false
 	}
+	cipher := ""
+	if newIb.Protocol == "shadowsocks" {
+		cipher = shadowsocksSettingsMethod(newRest)
+	}
 	for email, oldC := range oldClients {
 		newC, exists := newClients[email]
 		if exists && bytes.Equal(oldC.norm, newC.norm) {
@@ -208,15 +288,36 @@ func diffInboundUsers(oldIb, newIb *InboundConfig, diff *HotDiff) bool {
 		}
 		diff.RemovedUsers = append(diff.RemovedUsers, UserOp{Tag: oldIb.Tag, Protocol: oldIb.Protocol, Email: email})
 		if exists {
-			diff.AddedUsers = append(diff.AddedUsers, UserOp{Tag: oldIb.Tag, Protocol: oldIb.Protocol, Email: email, User: newC.user})
+			diff.AddedUsers = append(diff.AddedUsers, UserOp{Tag: oldIb.Tag, Protocol: oldIb.Protocol, Email: email, User: userWithCipher(newC.user, cipher)})
 		}
 	}
 	for email, newC := range newClients {
 		if _, exists := oldClients[email]; !exists {
-			diff.AddedUsers = append(diff.AddedUsers, UserOp{Tag: oldIb.Tag, Protocol: oldIb.Protocol, Email: email, User: newC.user})
+			diff.AddedUsers = append(diff.AddedUsers, UserOp{Tag: oldIb.Tag, Protocol: oldIb.Protocol, Email: email, User: userWithCipher(newC.user, cipher)})
 		}
 	}
 	return true
+}
+
+// shadowsocksSettingsMethod reads the inbound-level method: 2022 clients carry
+// none, and AddUser needs it to pick the account type the running inbound expects.
+func shadowsocksSettingsMethod(rest []byte) string {
+	var settings struct {
+		Method string `json:"method"`
+	}
+	if json.Unmarshal(rest, &settings) != nil {
+		return ""
+	}
+	return settings.Method
+}
+
+func userWithCipher(user map[string]any, cipher string) map[string]any {
+	if cipher == "" {
+		return user
+	}
+	withCipher := maps.Clone(user)
+	withCipher["cipher"] = cipher
+	return withCipher
 }
 
 type clientEntry struct {
@@ -298,12 +399,10 @@ func inboundUsesTproxy(ib *InboundConfig) bool {
 }
 
 // inboundUsesSocksAccounts reports whether an inbound is a password-auth
-// SOCKS5 inbound with one or more named accounts -- the shape
-// internal/amneziawgnet's per-inbound relay (internal/web/service/xray.go's
-// injectAmneziawgnetSocks) is the only generator of in this fork; every
-// other SOCKS5 bridge this fork builds (panel egress, per-node egress,
-// mtproto egress) uses "noauth" with no per-account identity at all, so this
-// check can't accidentally rope in one of those lower-churn bridges.
+// SOCKS5 inbound. TUIC and AmneziaWG generate this shape through
+// injectTuicRelay and injectAmneziawgnetSocks in internal/web/service/xray.go.
+// The panel, per-node and MTProto egress bridges use "noauth" without
+// per-account identity, so this check does not affect those bridges.
 //
 // Real production incident, not a theoretical concern: a single client
 // edit under an AmneziaWG inbound left this inbound's settings unchanged in

@@ -19,13 +19,19 @@ Xray JSON config from that state, supervises the Xray child process, and exposes
 WebSocket API. A React SPA (built by Vite, embedded into the Go binary) is the UI. A second,
 separate HTTP server serves **subscription links** to end users.
 
-The panel supervises **two managed child processes**: Xray-core itself and — when MTProto
-inbounds exist — the `mtg-multi` Telegram-proxy binary (`github.com/mhsanaei/mtg-multi`, a
-multi-secret fork built from source; `internal/mtproto/`). One process per inbound serves
-every attached client's FakeTLS secret through the fork's `[secrets]` section, plus optional
-per-client sponsored-channel ad-tags via `[secret-ad-tags]`. A client or ad-tag edit is
-hot-applied via the fork's management API (`PUT /secrets`, guarded by a per-process bearer
-token), with a process restart as the fallback on older binaries.
+The panel supervises **managed child processes**: Xray-core itself and — when MTProto
+inbounds exist — a dedicated child proxy binary:
+
+- **`mtg-multi` for MTProto inbounds** (`github.com/mhsanaei/mtg-multi`, a multi-secret fork
+  built from source; `internal/mtproto/`): One process per inbound serves every attached
+  client's FakeTLS secret through the fork's `[secrets]` section, plus optional per-client
+  sponsored-channel ad-tags via `[secret-ad-tags]`. A client or ad-tag edit is hot-applied via
+  the fork's management API (`PUT /secrets`, guarded by a per-process bearer token), with a
+  process restart as the fallback on older binaries.
+
+In contrast, **AmneziaWG** (`internal/amneziawgnet/`) and **TUIC v5** (`internal/tuic/`) run as
+**in-process native Go servers** without external child processes, bridging client traffic into
+Xray-core via loopback SOCKS5 relays.
 
 Servers and processes, all launched from `main.go`:
 
@@ -58,7 +64,7 @@ Two key ideas that explain most of the complexity:
 - Scheduler: **robfig/cron/v3** (seconds-precision) for all background jobs.
 - Xray: **xtls/xray-core** vendored as a library; the panel talks to the running core over
   its **gRPC API** and also shells out to manage the process.
-- Telegram bot: **mymmrac/telego**. i18n: **nicksnyder/go-i18n**.
+- Bots: Telegram bot (**mymmrac/telego**), Discord bot (Discord REST API v10 + **gorilla/websocket** Gateway v10). i18n: **nicksnyder/go-i18n**.
 - Misc: gorilla/websocket, gopsutil (system stats), go-qrcode, gotp (2FA TOTP).
 
 **Frontend (`frontend/`):**
@@ -210,6 +216,7 @@ node heartbeat every 5s, periodic traffic resets (hourly/daily/weekly/monthly). 
 │   │   │   │   ├── user.go             #   admin user auth (bcrypt)
 │   │   │   │   ├── api_token.go        #   API token CRUD (SHA-256 hashed)
 │   │   │   │   └── websocket.go        #   WS hub / push service
+│   │   │   ├── discord/                # Discord bot client, Gateway v10, and subscriber
 │   │   │   └── tgbot/                  # Telegram bot command handlers
 │   │   ├── runtime/            # ⭐⭐ The Local/Remote node abstraction (see §5.2)
 │   │   │   ├── runtime.go      #   the Runtime interface (the contract)
@@ -224,7 +231,7 @@ node heartbeat every 5s, periodic traffic resets (hourly/daily/weekly/monthly). 
 │   │   ├── network/          # Custom net listeners (e.g. proxy-protocol aware)
 │   │   ├── session/          # Session/cookie helpers
 │   │   ├── websocket/        # WS hub implementation
-│   │   ├── locale/ + translation/  # i18n middleware + 13 locale JSON catalogs
+│   │   ├── locale/ + translation/  # i18n middleware + 14 locale JSON catalogs
 │   │   ├── entity/           # Shared request/response DTOs
 │   │   └── dist/             # ⚠️ Vite build output, embedded via go:embed (generated — do not hand-edit)
 │   │
@@ -284,7 +291,7 @@ node heartbeat every 5s, periodic traffic resets (hourly/daily/weekly/monthly). 
 ├── install.sh / update.sh / x-ui.sh                        # VPS install + management CLI
 ├── x-ui.service.*  / x-ui.rc                               # systemd units (debian/rhel/arch) + rc script
 ├── windows_files/                                          # Windows service support
-└── .github/workflows/        # CI: ci.yml, codeql.yml, docker.yml, release.yml, smoke.yml,
+└── .github/workflows/        # CI: ci.yml, codeql.yml, docker.yml, release.yml,
                               #     mutation.yml, cleanup_caches.yml, claude-pr-review.yml,
                               #     claude-issue-analyst.yml
 ```
@@ -313,6 +320,12 @@ Restart is debounced via an atomic "need restart" flag (`SetToNeedRestart` /
 **Key files:** `service/xray.go` (orchestration), `xray/hot_diff.go` (the diff algorithm),
 `xray/process.go` (process lifecycle), `xray/api.go` (gRPC calls), `xray/config.go` (config model).
 
+Inbound-list statistics read only UUID, email and subscription ID from `clients`, joined
+through `client_inbounds` in batches of up to 400 distinct inbound IDs. Full client records
+remain the source for Xray and subscriptions. Missing shared-client traffic is fetched by
+email, including rows owned by an inbound outside the requested list; enrichment preserves
+the stored traffic, lifecycle and last-online fields.
+
 ### 5.2 Runtime abstraction — Local vs Remote (multi-node) ⭐ most important
 
 A "node" (`model.Node`) is another 3x-ui instance this panel controls. Every state-changing
@@ -332,6 +345,22 @@ code_ works whether the target is the local Xray or a remote node.
   `service/node_mtls.go` + `service/setting_mtls.go`.
 - **Dispatch:** `manager.go` → `Manager.RuntimeFor(nodeID *int)`; `nil` nodeID → `Local`,
   otherwise a cached/lazy-loaded `Remote`. `InvalidateNode(id)` drops a cached remote client.
+
+Bearer tokens use the narrowest scope that matches the caller's duties:
+
+| Scope        | Access                                                                 |
+| ------------ | ---------------------------------------------------------------------- |
+| `monitor`    | Read-only status, version, and metric endpoints.                       |
+| `node-sync`  | Node configuration, inbound/client synchronization, traffic, and Xray. |
+| `node-admin` | All `node-sync` access plus `POST /panel/api/server/updatePanel`.      |
+| `admin`      | Every panel API endpoint; intended for fully trusted automation.       |
+
+`node-admin` remains a node synchronization identity when inbound rules are applied. This
+preserves the node-specific validation path while keeping software-update authority separate
+from ordinary `node-sync` credentials. On an mTLS connection, only a valid `node-admin` bearer
+elevates the request; other bearer scopes retain the historical mTLS `node-sync` behavior.
+Existing tokens retain their stored scope, and legacy tokens without one continue to migrate to
+`admin`.
 
 **Node identity & attribution (the hard part).** Inbounds carry a `NodeID` _and_ an
 `OriginNodeGuid`. Because inbounds can be pushed across hops, the panel attributes traffic and
@@ -359,33 +388,47 @@ merged with GUID-based baselines to avoid double counting after resets.
 `job/xray_traffic_job.go`, `job/node_traffic_sync_job.go`, `service/inbound_node.go`
 (`SetRemoteTraffic` / `upsertNodeBaseline`), models `xray.ClientTraffic`,
 `model.NodeClientTraffic`, `model.ClientGlobalTraffic` (cross-master totals).
+A client reset is queued per hosting node in `model.NodePendingReset` (`service/node_reset_queue.go`)
+and replayed by the node sync until the node accepts it.
 Periodic resets: `job/periodic_traffic_reset_job.go` (keyed off `Inbound.TrafficReset`).
+
+Cross-panel totals are stored per master GUID and hosted email, separately from local
+`client_traffics`. Directional counter changes, including lower values and resets, persist
+on the next push. Identical totals refresh only when the persisted timestamp is at least
+one hour old; pushes still send the same batches. Display and quota reads retain the
+inclusive 24-hour persisted-row freshness window. Full-list snapshots remain local-only,
+while slim/detail reads and downstream forwarding retain their global overlays.
+
+The heartbeat coarsens liveness, not counter propagation: an idle master can expire up to
+one hour earlier relative to its final unchanged push. Active hourly refresh leaves roughly
+23 hours of missed-push margin. No cache, external service or configurable interval is added.
 
 ### 5.4 Background jobs (cron)
 
 All registered in `web.go` → `startTask()`. Each is a struct with a `Run()` method in `internal/web/job/`:
 
-| Schedule            | Job                                                                                              | Purpose / condition                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| `@every 1s`         | `check_xray_running_job`                                                                         | Restart Xray if it died (2 consecutive down checks)                             |
-| `@every 30s`        | (inline func in `startTask`)                                                                     | Debounced Xray restart — consumes the "need restart" flag (§5.1)                |
-| `@every 5s`         | `xray_traffic_job`                                                                               | Pull traffic stats from Xray (5s start delay)                                   |
-| `@every 5s`         | `node_heartbeat_job`                                                                             | Probe child nodes (online/offline)                                              |
-| `@every 5s`         | `node_traffic_sync_job`                                                                          | Pull + merge node traffic; push reconciliation                                  |
-| `@every 10s`        | `check_client_ip_job`                                                                            | Enforce per-client IP limits                                                    |
-| `@every 10s`        | `mtproto_job`                                                                                    | Reconcile `mtg` sidecars against enabled MTProto inbounds                       |
-| `@every 10s`        | `amneziawg_job`                                                                                  | Reconcile embedded AmneziaWG interfaces against enabled local inbounds          |
-| `@every 5m`         | `outbound_subscription_job`                                                                      | Refresh outbound provider configs                                               |
-| `@every 10m`        | `clear_logs_job` (`PruneXrayLogsJob`)                                                            | Truncate Xray access/error logs once either exceeds 64 MiB                      |
-| `@hourly`           | `warp_ip_job`, `periodic_traffic_reset_job("hourly")`                                            | WARP IP rotation; traffic resets                                                |
-| `@daily`            | `clear_logs_job`, `periodic_traffic_reset_job("daily")`, `periodic_traffic_reset_job("monthly")` | IP-limit and Xray access/error log cleanup; daily resets and due monthly resets |
-| `@weekly`           | `periodic_traffic_reset_job("weekly")`                                                           | Weekly traffic resets                                                           |
-| default `@every 1m` | `ldap_sync_job`                                                                                  | Only if LDAP enabled; schedule configurable                                     |
-| default `@daily`    | `stats_notify_job`                                                                               | Only if TG bot enabled; schedule configurable                                   |
-| `@every 2m`         | `check_hash_storage`                                                                             | Only if TG bot enabled; expires bot callback hashes                             |
-| `@every 1m`         | `check_cpu_usage`                                                                                | Only if a CPU alarm is configured (TG or email); publishes `cpu.high`           |
-| `@every 1m`         | `check_memory_usage`                                                                             | Only if a memory alarm is configured; publishes `memory.high`                   |
-| configurable        | `free_os_memory`                                                                                 | Only if `sys.MemoryReleaseIntervalMinutes() > 0`; returns heap to OS            |
+| Schedule            | Job                                                                                              | Purpose / condition                                                                   |
+| ------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `@every 1s`         | `check_xray_running_job`                                                                         | Restart Xray if it died (2 consecutive down checks)                                   |
+| `@every 30s`        | (inline func in `startTask`)                                                                     | Debounced Xray restart — consumes the "need restart" flag (§5.1)                      |
+| `@every 5s`         | `xray_traffic_job`                                                                               | Pull traffic stats from Xray (5s start delay)                                         |
+| `@every 5s`         | `node_heartbeat_job`                                                                             | Probe child nodes (online/offline)                                                    |
+| `@every 5s`         | `node_traffic_sync_job`                                                                          | Pull + merge node traffic; push reconciliation                                        |
+| `@every 10s`        | `check_client_ip_job`                                                                            | Record client IPs (30-min window) and enforce per-client IP limits                    |
+| `@every 10s`        | `mtproto_job`                                                                                    | Reconcile `mtg` sidecars against enabled MTProto inbounds                             |
+| `@every 10s`        | `amneziawg_job`                                                                                  | Reconcile embedded AmneziaWG interfaces against enabled local inbounds                |
+| `@every 5m`         | `outbound_subscription_job`                                                                      | Refresh outbound provider configs                                                     |
+| `@every 10m`        | `clear_logs_job` (`PruneXrayLogsJob`)                                                            | Truncate Xray access/error logs once either exceeds 64 MiB                            |
+| `@hourly`           | `warp_ip_job`, `periodic_traffic_reset_job("hourly")`                                            | WARP IP rotation; traffic resets                                                      |
+| `@daily`            | `clear_logs_job`, `periodic_traffic_reset_job("daily")`, `periodic_traffic_reset_job("monthly")` | IP-limit and Xray access/error log cleanup; daily resets and due monthly resets       |
+| `@weekly`           | `periodic_traffic_reset_job("weekly")`                                                           | Weekly traffic resets                                                                 |
+| default `@every 1m` | `ldap_sync_job`                                                                                  | Only if LDAP enabled; schedule configurable                                           |
+| default `@daily`    | `stats_notify_job`                                                                               | Only if TG bot enabled; schedule configurable                                         |
+| default `@daily`    | `discord_notify_job`                                                                             | Only if Discord bot enabled; schedule configurable                                    |
+| `@every 2m`         | `check_hash_storage`                                                                             | Only if TG bot enabled; expires bot callback hashes                                   |
+| `@every 1m`         | `check_cpu_usage`                                                                                | Only if a CPU alarm is configured (TG, Discord, or email); publishes `cpu.high`       |
+| `@every 1m`         | `check_memory_usage`                                                                             | Only if a memory alarm is configured (TG, Discord, or email); publishes `memory.high` |
+| configurable        | `free_os_memory`                                                                                 | Only if `sys.MemoryReleaseIntervalMinutes() > 0`; returns heap to OS                  |
 
 To change _when_ something runs, edit `startTask()`. To change _what_ it does, edit the job file.
 
@@ -426,7 +469,7 @@ also has protocol schemas under `frontend/src/schemas/protocols/` and `frontend/
 `xray.crash`, `node.down|up`, `cpu.high`, `memory.high`, `login.attempt`, with structured
 payloads (OutboundHealthData, NodeHealthData, LoginEventData, SystemMetricData). Producers
 include the CPU/memory jobs, node heartbeat, and login handling; consumers include the
-Telegram bot and the email notifier (`service/email/`). Use it for cross-cutting
+Telegram bot, the Discord bot (`service/discord/`), and the email notifier (`service/email/`). Use it for cross-cutting
 notifications instead of importing notification services into producers.
 
 ### 5.8 Tunnel health monitor
@@ -456,6 +499,7 @@ for AutoMigrate in `internal/database/db.go`.
 | `Host`                          | Subscription host overrides (per inbound) | `Address`, `Port`, `Sni`, `Path`, `Security`, `Fingerprint`, `SortOrder`, visibility/exclusion flags                                                               |
 | `Node`                          | A managed child panel                     | `Guid`, `Address`, `Status`, `TlsVerifyMode`, `PinnedCertSha256`, `ConfigDirty`, version/heartbeat/metric fields                                                   |
 | `NodeClientTraffic`             | Per-node client traffic baseline          | cross-node merge (anti-double-count)                                                                                                                               |
+| `NodePendingReset`              | Client resets a node has not confirmed    | `NodeId`, `Email`, `QueuedAt`; replayed by the node sync, freezes that client's node verdict until delivered                                                       |
 | `NodeClientIp`                  | Per-node client IP attribution            | `NodeGuid`, `Email`, `Ips`                                                                                                                                         |
 | `ClientGlobalTraffic`           | Cross-master usage totals                 | `MasterGuid`, `Email`, `Up`, `Down`                                                                                                                                |
 | `xray.ClientTraffic`            | Per-client counters (`client_traffics`)   | `Email`, `Up`, `Down`, `Total`, `ExpiryTime`, `LastOnline`                                                                                                         |
@@ -497,6 +541,7 @@ for AutoMigrate in `internal/database/db.go`.
 | **Geo category browser** empty / won't open                                       | `xray/geodata/` (`Store`, `reader.go`), `service/geodata.go`                 | `controller/xray_setting.go` (`/panel/api/xray/geodata/*`), asset dir = `config.GetBinFolderPath()` |
 | **`geosite:`/`geoip:` token** reported unknown in a routing rule                  | `xray/geodata/token.go`, `service/geodata.go` (`Validate`)                   | `frontend/src/lib/xray/geoTokens.ts`, `frontend/src/components/geodata/`                            |
 | **Telegram bot** commands                                                         | `service/tgbot/`                                                             | `job/stats_notify_job.go`                                                                           |
+| **Discord bot** commands & reports                                                | `service/discord/`                                                           | `job/discord_notify_job.go`                                                                         |
 | **Email notifications**                                                           | `service/email/`                                                             | `internal/eventbus/` (consumers)                                                                    |
 | **CPU / memory alerts** not firing                                                | `job/check_cpu_usage.go`, `job/check_memory_usage.go`                        | `internal/eventbus/`, notifier settings in `service/setting.go`                                     |
 | Xray auto-restart on **dead tunnel**                                              | `internal/tunnelmonitor/`                                                    | `XUI_TUNNEL_HEALTH_*` in `internal/config/`                                                         |
@@ -532,7 +577,7 @@ for AutoMigrate in `internal/database/db.go`.
 8. **Two servers, two concerns.** Admin features go in `internal/web`; anything an _end user_
    fetches goes in `internal/sub`. Don't blur them.
 9. **Cross-cutting notifications go through `internal/eventbus/`** — publish an event instead
-   of importing the Telegram/email services into producers.
+   of importing the Telegram/Discord/email services into producers.
 
 ---
 
@@ -555,7 +600,7 @@ golangci-lint run                   # full lint (gofumpt + goimports formatting)
 go run main.go                      # run the panel locally (serves embedded dist if built)
 ```
 
-**Frontend (`cd frontend`, Node 24 — see `.nvmrc`):**
+**Frontend (`cd frontend`, Node 26 — see `.nvmrc`):**
 
 ```bash
 npm install
@@ -573,9 +618,10 @@ root → `go build ./...` / `go run main.go`.
 **Docker:** `docker compose up -d` (uses `Dockerfile` + `DockerEntrypoint.sh`).
 
 **CI** (`.github/workflows/`): `ci.yml` (build/test/lint), `codeql.yml` (security scan),
-`smoke.yml` (smoke tests), `mutation.yml` (mutation testing), `docker.yml` + `release.yml`
+`mutation.yml` (mutation testing), `docker.yml` + `release.yml`
 (multi-arch image + release builds), `cleanup_caches.yml`, `claude-pr-review.yml` (PR review
-only - it changes no code), `claude-issue-analyst.yml` (issue triage).
+only - it changes no code), `claude-issue-analyst.yml` (issue triage). A maintainer re-runs
+them with a comment starting `@claude review` on a PR or `@claude analyze` on an issue.
 
 ---
 
@@ -594,9 +640,36 @@ only - it changes no code), `claude-issue-analyst.yml` (issue triage).
   (`FetchCertFingerprint`), `service/node_mtls.go`, and `runtime/tls_client.go`.
 - **Restart is signal-driven.** `main.go` traps SIGHUP to restart panel+sub servers; the
   in-process restart hook (`global.SetRestartHook`) funnels into the same path.
-- **i18n:** backend catalogs in `internal/web/translation/` (13 locales, shared with the
+- **i18n:** backend catalogs in `internal/web/translation/` (14 locales, shared with the
   frontend); frontend wiring in `frontend/src/i18n/`. Persian (`fa_IR`) is a first-class
   locale (Jalali calendar via `persian-calendar-suite`).
 - **Tests live next to code** (`foo.go` ↔ `foo_test.go`), plus golden snapshots in
   `frontend/src/test/golden/fixtures/` for config generation — update fixtures intentionally,
   not blindly, when output changes.
+
+## AmneziaWG outbound pseudo-protocol
+
+The template stores `protocol: "amneziawg"` rows verbatim; Xray-core has no
+such proxy. At config generation (`GetXrayConfig` and the outbound latency
+probe's batch config) each row is swapped by `amneziawgnet.BuildSocksBridge`
+into a loopback socks outbound pointed at the panel's egress server (port
+`EgressBasePort`), authenticating with the row's tag as username. Sibling keys
+(`mux`, `sendThrough`, `targetStrategy`, `streamSettings.sockopt`) survive the
+swap. The embedded amneziawg-go client device lives in the panel process; an
+unbridgeable entry (unreadable settings, empty/non-string tag) fails config
+generation instead of skipping, because a skipped entry leaves
+`protocol: "amneziawg"` behind -- which makes Xray refuse the whole config.
+
+Traffic flow: Xray socks client -> egress SOCKS5 server (tag = username) ->
+per-tag device netstack -> amneziawg-go tunnel. Domain targets are resolved by
+a DNS exchange through that same netstack (`resolveTunnelVia`, default server
+`DefaultTunnelDNSServer`), so names never leak to the panel host's resolver and
+answers are valid at the tunnel's location; results cache for 60s. UDP flows
+key sessions on the resolved address:port. Peer endpoints may be hostnames:
+`resolvingBind.ParseEndpoint` resolves once at configure time (kernel
+`wg setconf` semantics); a hostname whose DNS dies later needs a template
+re-save or job restart to re-resolve.
+
+`randomTrailers` defaults to false wherever the panel does not control the
+peer (outbound form/schema): a receiver without 3.1 trailers silently drops
+oversized packets from a sender with it enabled.

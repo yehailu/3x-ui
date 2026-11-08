@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -12,20 +15,61 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/netsafe"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
 
-// External subscription fetching: a "subscription" external link is a remote
-// URL whose body is a (often base64-encoded) newline list of share links. We
-// fetch it on demand, cache the decoded links briefly, and bound the request
-// with a short timeout so a slow/dead provider can't stall a client's sub.
+// External subscription fetching: a remote URL whose body is a share-link
+// list. Fetches are cached briefly and bounded so a dead provider can't stall.
 
 const (
 	subscriptionCacheTTL      = 5 * time.Minute
 	subscriptionMaxBytes      = 2 << 20 // 2 MiB
+	subscriptionMaxLinks      = 1000
 	subscriptionCacheCapacity = 256
 )
 
-var subscriptionHTTPClient = &http.Client{Timeout: 6 * time.Second}
+// The provider picks every redirect target, so each hop is resolved, checked and dialed by
+// the SSRF guard; its headers are bounded like its body.
+var subscriptionHTTPClient = &http.Client{
+	Timeout: 6 * time.Second,
+	Transport: &http.Transport{
+		DialContext:            netsafe.SSRFGuardedDialContext,
+		TLSHandshakeTimeout:    5 * time.Second,
+		MaxResponseHeaderBytes: 64 << 10,
+		IdleConnTimeout:        90 * time.Second,
+	},
+}
+
+// subscriptionProxy is the host's proxy setting: the proxy is the operator's and does the
+// dialling, so a proxied fetch goes through it as the default transport did.
+var subscriptionProxy = http.ProxyFromEnvironment
+
+var proxiedSubscriptionHTTPClient = &http.Client{
+	Timeout: 6 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                  func(r *http.Request) (*url.URL, error) { return subscriptionProxy(r) },
+		TLSHandshakeTimeout:    5 * time.Second,
+		MaxResponseHeaderBytes: 64 << 10,
+		IdleConnTimeout:        90 * time.Second,
+	},
+}
+
+// subscriptionClientFor picks the proxied client when the host's proxy setting covers req.
+func subscriptionClientFor(req *http.Request) *http.Client {
+	if proxyURL, err := subscriptionProxy(req); err == nil && proxyURL != nil {
+		return proxiedSubscriptionHTTPClient
+	}
+	return subscriptionHTTPClient
+}
+
+// operatorChosePrivateHost reports a URL naming a private address itself: the operator picked
+// it. A hostname does not count, since the provider controls what its DNS answers.
+func operatorChosePrivateHost(u *url.URL) bool {
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && netsafe.IsBlockedIP(ip)
+}
 
 type subscriptionCacheEntry struct {
 	links     []string
@@ -130,7 +174,7 @@ func recordExternalSubscriptionFetch(rawURL string, fetchErr error) {
 	}
 	lastFetchError := ""
 	if fetchErr != nil {
-		lastFetchError = fetchErr.Error()
+		lastFetchError = common.TruncateStatusText(service.WithoutRequestURL(fetchErr).Error())
 	}
 	if err := database.GetDB().
 		Model(&model.ClientExternalLink{}).
@@ -139,20 +183,27 @@ func recordExternalSubscriptionFetch(rawURL string, fetchErr error) {
 			"last_fetch_at":    time.Now().UnixMilli(),
 			"last_fetch_error": lastFetchError,
 		}).Error; err != nil {
-		logger.Warningf("sub: recording fetch status for external subscription %q: %v", rawURL, err)
+		logger.Warningf("sub: recording fetch status for an external subscription: %v", err)
 	}
 }
 
 func doFetchSubscriptionLinks(rawURL string) ([]string, error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, service.WithoutRequestURL(err)
 	}
+	// A provider on the operator's own network is fetched; the hops a public provider picks by
+	// redirecting stay held to public addresses.
+	req = req.WithContext(netsafe.ContextWithAllowPrivate(req.Context(), operatorChosePrivateHost(req.URL)))
 	// Some providers gate the link body on a known client User-Agent.
-	req.Header.Set("User-Agent", "v2rayNG/1.8.5")
-	resp, err := subscriptionHTTPClient.Do(req)
+	req.Header.Set("User-Agent", externalSubUserAgent())
+	// A 3x-ui donor with an HWID limit answers 404 when the header is empty (#6559).
+	if hwid := service.ExternalSubscriptionHwid(); hwid != "" {
+		req.Header.Set("X-HWID", hwid)
+	}
+	resp, err := subscriptionClientFor(req).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, service.WithoutRequestURL(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -165,7 +216,12 @@ func doFetchSubscriptionLinks(rawURL string) ([]string, error) {
 	if len(body) > subscriptionMaxBytes {
 		return nil, errSubscriptionBodyTooLarge
 	}
-	return decodeSubscriptionBody(body), nil
+	links := decodeSubscriptionBody(body)
+	if len(links) > subscriptionMaxLinks {
+		logger.Warningf("sub: an external subscription lists %d share links; serving the first %d", len(links), subscriptionMaxLinks)
+		links = links[:subscriptionMaxLinks]
+	}
+	return links, nil
 }
 
 var (
@@ -173,12 +229,33 @@ var (
 	errSubscriptionBodyTooLarge = &subError{"subscription response body exceeds size limit"}
 )
 
+// externalSubUserAgent returns the panel setting for external subscription
+// fetches, or the historical client UA when it is unset or the DB is unreachable.
+func externalSubUserAgent() string {
+	if database.GetDB() == nil {
+		return service.DefaultExternalSubUserAgent
+	}
+	ua, err := (&service.SettingService{}).GetExternalSubUserAgent()
+	if err != nil {
+		return service.DefaultExternalSubUserAgent
+	}
+	return ua
+}
+
 type subError struct{ msg string }
 
 func (e *subError) Error() string { return e.msg }
 
-// decodeSubscriptionBody handles the common base64-encoded newline list as well
-// as a plain-text body, returning only the lines that look like share links.
+// serverShareLinkSchemes are the server links a raw subscription carries on: what the link
+// parser reads, what the panel itself writes, and common third-party server schemes.
+var serverShareLinkSchemes = []string{
+	"vmess", "vless", "trojan", "ss", "ssr", "hysteria", "hysteria2", "hy2", "tuic", "wireguard", "wg",
+	"vpn", "socks", "socks5", "anytls", "juicity", "naive+https", "tg",
+}
+
+// decodeSubscriptionBody handles the common base64-encoded newline list as well as a
+// plain-text body, keeping only server share links: app deeplinks and plain URLs would
+// reach the subscriber's app as directives the operator never chose.
 func decodeSubscriptionBody(body []byte) []string {
 	text := strings.TrimSpace(string(body))
 	if text == "" {
@@ -194,7 +271,8 @@ func decodeSubscriptionBody(body []byte) []string {
 		if ln == "" || strings.HasPrefix(ln, "#") {
 			continue
 		}
-		if strings.Contains(ln, "://") {
+		scheme, _, found := strings.Cut(ln, "://")
+		if found && slices.ContainsFunc(serverShareLinkSchemes, func(s string) bool { return strings.EqualFold(s, scheme) }) {
 			out = append(out, ln)
 		}
 	}

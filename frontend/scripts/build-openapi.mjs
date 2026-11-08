@@ -23,7 +23,7 @@ const SECURITY_SCHEMES = {
     type: 'http',
     scheme: 'bearer',
     description:
-      'API token from Settings → Security → API Token. Send as `Authorization: Bearer <token>`.',
+      'Scoped API token from Settings → Security → API Token. Send as `Authorization: Bearer <token>`.',
   },
   cookieAuth: {
     type: 'apiKey',
@@ -110,6 +110,21 @@ function paramToOpenApi(p) {
     schema: schemaFromParam(p),
   };
   return out;
+}
+
+// A `responses` entry that $refs a generated schema takes its example from the
+// Go `example:` tags, the same source responseSchema uses — never hand-written.
+function withGeneratedExample(ep, code, res) {
+  const json = res.content?.['application/json'];
+  const name = json?.schema?.$ref?.replace('#/components/schemas/', '');
+  if (!name) return res;
+  if (SCHEMAS[name] === undefined || EXAMPLES[name] === undefined) {
+    throw new Error(`${ep.method} ${ep.path}: ${code} response schema "${name}" is not generated`);
+  }
+  return {
+    ...res,
+    content: { ...res.content, 'application/json': { example: EXAMPLES[name], ...json } },
+  };
 }
 
 function buildOperation(ep, tag) {
@@ -245,13 +260,21 @@ function buildOperation(ep, tag) {
       );
     }
     const ref = { $ref: `#/components/schemas/${ep.responseSchema}` };
-    objSchema = ep.responseSchemaArray ? { type: 'array', items: ref } : ref;
+    objSchema = ep.responseSchemaArray
+      ? {
+          type: 'array',
+          ...(ep.responseSchemaArrayNullable ? { nullable: true } : {}),
+          items: ref,
+        }
+      : ref;
     if (successExample === undefined) {
       successExample = { success: true, obj: ep.responseSchemaArray ? [obj] : obj };
     }
   }
   if (ep.responses) {
-    Object.assign(responses, ep.responses);
+    for (const [code, res] of Object.entries(ep.responses)) {
+      responses[code] = withGeneratedExample(ep, code, res);
+    }
   } else {
     responses['200'] = {
       description: 'Successful response',
@@ -319,7 +342,7 @@ export function buildSpec() {
       title: '3X-UI Panel API',
       version: PANEL_VERSION,
       description:
-        'Programmatic interface to a 3X-UI panel. Authenticate either by logging in (cookie) or with an API token from Settings → Security → API Token (Bearer). All endpoints under /panel/api/* honour both modes — an API token is a full-admin credential, so treat it like the panel password.',
+        'Programmatic interface to a 3X-UI panel. Authenticate either by logging in (cookie) or with a scoped API token from Settings → Security → API Token (Bearer). Token access is limited by its admin, monitor, node-sync, or node-admin scope; treat admin tokens like the panel password.',
     },
     servers: [{ url: '/', description: 'Current panel (basePath aware)' }],
     components: {

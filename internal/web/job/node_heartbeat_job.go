@@ -2,7 +2,10 @@ package job
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +20,27 @@ import (
 const (
 	nodeHeartbeatConcurrency    = 32
 	nodeHeartbeatRequestTimeout = 4 * time.Second
+	// Past this many same-direction transitions in one tick, one summary event goes out:
+	// per-node events overflow the notifier queues and every chat's rate limit.
+	nodeTransitionBurst      = 5
+	nodeTransitionBurstNames = 10
 )
 
 type NodeHeartbeatJob struct {
-	nodeService service.NodeService
-	running     sync.Mutex
+	nodeService    service.NodeService
+	settingService service.SettingService
+	running        sync.Mutex
+	health         map[int]nodeHealth
+}
+
+type nodeHealth struct {
+	failStreak int
+	notified   bool
+}
+
+type nodeProbe struct {
+	node  *model.Node
+	patch service.HeartbeatPatch
 }
 
 func NewNodeHeartbeatJob() *NodeHeartbeatJob {
@@ -39,12 +58,15 @@ func (j *NodeHeartbeatJob) Run() {
 		logger.Warning("node heartbeat: load nodes failed:", err)
 		return
 	}
+	j.nodeService.RetainEnabledNodeDescendants(nodes)
 	if len(nodes) == 0 {
 		return
 	}
 
 	sem := make(chan struct{}, nodeHeartbeatConcurrency)
 	var wg sync.WaitGroup
+	var probesMu sync.Mutex
+	var probes []nodeProbe
 	for _, n := range nodes {
 		if !n.Enable {
 			continue
@@ -55,10 +77,14 @@ func (j *NodeHeartbeatJob) Run() {
 		common.GoRecover("node-heartbeat:"+n.Name, func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			j.probeOne(n)
+			patch := j.probeOne(n)
+			probesMu.Lock()
+			probes = append(probes, nodeProbe{node: n, patch: patch})
+			probesMu.Unlock()
 		})
 	}
 	wg.Wait()
+	publishNodeTransitions(j.healthTransitions(probes))
 
 	if !websocket.HasClients() {
 		return
@@ -71,10 +97,9 @@ func (j *NodeHeartbeatJob) Run() {
 	websocket.BroadcastNodes(updated)
 }
 
-func (j *NodeHeartbeatJob) probeOne(n *model.Node) {
+func (j *NodeHeartbeatJob) probeOne(n *model.Node) service.HeartbeatPatch {
 	ctx, cancel := context.WithTimeout(context.Background(), nodeHeartbeatRequestTimeout)
 	defer cancel()
-	prevStatus := n.Status
 	patch, err := j.nodeService.Probe(ctx, n)
 	if err != nil {
 		patch.Status = "offline"
@@ -84,7 +109,6 @@ func (j *NodeHeartbeatJob) probeOne(n *model.Node) {
 	if updErr := j.nodeService.UpdateHeartbeat(n.Id, patch); updErr != nil {
 		logger.Warning("node heartbeat: update node", n.Id, "failed:", updErr)
 	}
-	publishNodeTransition(n, prevStatus, patch)
 	// Learn the nodes this node manages so the panel can surface them as
 	// transitive sub-nodes (#4983). Fresh context — the probe budget above may
 	// be spent. Drop them when the node is unreachable.
@@ -95,29 +119,53 @@ func (j *NodeHeartbeatJob) probeOne(n *model.Node) {
 	} else {
 		j.nodeService.ClearDescendants(n.Id)
 	}
+	return patch
 }
 
-// publishNodeTransition emits node.down / node.up only on a genuine state change.
-// An "unknown"/empty previous status (fresh start) is treated as not-online, so a
-// node coming up for the first time fires node.up but never a spurious node.down.
-func publishNodeTransition(n *model.Node, prevStatus string, patch service.HeartbeatPatch) {
-	if EventBus == nil {
-		return
+func (j *NodeHeartbeatJob) healthTransitions(probes []nodeProbe) []eventbus.Event {
+	threshold := 1
+	if v, err := j.settingService.GetNodeDownThreshold(); err == nil && v > 0 {
+		threshold = v
 	}
-	var eventType eventbus.EventType
-	switch {
-	case prevStatus == "online" && patch.Status == "offline":
-		eventType = eventbus.EventNodeDown
-	case prevStatus != "online" && patch.Status == "online":
-		eventType = eventbus.EventNodeUp
-	default:
-		return
+	prev := j.health
+	j.health = make(map[int]nodeHealth, len(probes))
+	var events []eventbus.Event
+	for _, p := range probes {
+		h, seen := prev[p.node.Id]
+		if !seen {
+			h.notified = p.node.DownNotified
+		}
+		if p.patch.Status == "online" {
+			if h.notified {
+				events = append(events, nodeHealthEvent(eventbus.EventNodeUp, p.node, p.patch))
+				j.saveDownNotified(p.node.Id, false)
+			}
+			h = nodeHealth{}
+		} else {
+			h.failStreak++
+			if h.failStreak >= threshold && !h.notified {
+				events = append(events, nodeHealthEvent(eventbus.EventNodeDown, p.node, p.patch))
+				h.notified = true
+				j.saveDownNotified(p.node.Id, true)
+			}
+		}
+		j.health[p.node.Id] = h
 	}
+	return events
+}
+
+func (j *NodeHeartbeatJob) saveDownNotified(id int, notified bool) {
+	if err := j.nodeService.SetDownNotified(id, notified); err != nil {
+		logger.Warning("node heartbeat: save down-notified flag for node", id, "failed:", err)
+	}
+}
+
+func nodeHealthEvent(eventType eventbus.EventType, n *model.Node, patch service.HeartbeatPatch) eventbus.Event {
 	source := n.Name
 	if source == "" {
 		source = "node-" + strconv.Itoa(n.Id)
 	}
-	EventBus.Publish(eventbus.Event{
+	return eventbus.Event{
 		Type:   eventType,
 		Source: source,
 		Data: &eventbus.NodeHealthData{
@@ -128,5 +176,34 @@ func publishNodeTransition(n *model.Node, prevStatus string, patch service.Heart
 			XrayState: patch.XrayState,
 			XrayError: patch.XrayError,
 		},
-	})
+	}
+}
+
+// publishNodeTransitions sends one tick's transitions, folding a same-direction burst
+// (a master-side blip flips every node at once) into one event naming the nodes.
+func publishNodeTransitions(events []eventbus.Event) {
+	if EventBus == nil {
+		return
+	}
+	namesByType := make(map[eventbus.EventType][]string)
+	for _, e := range events {
+		namesByType[e.Type] = append(namesByType[e.Type], e.Source)
+	}
+	for _, e := range events {
+		if len(namesByType[e.Type]) <= nodeTransitionBurst {
+			EventBus.Publish(e)
+		}
+	}
+	for _, eventType := range []eventbus.EventType{eventbus.EventNodeDown, eventbus.EventNodeUp} {
+		names := namesByType[eventType]
+		if len(names) <= nodeTransitionBurst {
+			continue
+		}
+		sort.Strings(names)
+		source := strings.Join(names[:min(len(names), nodeTransitionBurstNames)], ", ")
+		if extra := len(names) - nodeTransitionBurstNames; extra > 0 {
+			source += fmt.Sprintf(" (+%d)", extra)
+		}
+		EventBus.Publish(eventbus.Event{Type: eventType, Source: source})
+	}
 }

@@ -80,17 +80,85 @@ acme_listen_flag() {
 is_port_in_use() {
     local port="$1"
     if command -v ss > /dev/null 2>&1; then
-        ss -ltn 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {exit 0} END {exit 1}'
+        ss -ltn 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found = 1} END {exit !found}'
         return
     fi
     if command -v netstat > /dev/null 2>&1; then
-        netstat -lnt 2> /dev/null | awk -v p=":${port} " '$4 ~ p {exit 0} END {exit 1}'
+        netstat -lnt 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found = 1} END {exit !found}'
         return
     fi
     if command -v lsof > /dev/null 2>&1; then
         lsof -nP -iTCP:${port} -sTCP:LISTEN > /dev/null 2>&1 && return 0
     fi
     return 1
+}
+
+normalize_panel_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    # Strip leading zeros before bounding the length and doing arithmetic:
+    # Bash and the Go flag parser otherwise interpret leading zeros as octal.
+    port="${port#"${port%%[!0]*}"}"
+    [[ -n "$port" && ${#port} -le 5 ]] || return 1
+    ((10#$port <= 65535)) || return 1
+    printf '%s\n' "$port"
+}
+
+# Print only the selected decimal port to stdout; prompts/notices use stderr.
+select_panel_port() {
+    local confirm=n port attempt
+    if [[ "$NONINTERACTIVE" == 1 ]]; then
+        [[ -z "${XUI_PANEL_PORT+x}" ]] || confirm=y
+    else
+        while true; do
+            if ! IFS= read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/N]: " confirm; then
+                echo 'Cannot read the panel port confirmation; aborting.' >&2
+                return 1
+            fi
+            confirm="${confirm#"${confirm%%[![:space:]]*}"}"
+            confirm="${confirm%"${confirm##*[![:space:]]}"}"
+            case "${confirm,,}" in
+                y | yes) break ;;
+                n | no | '') confirm=n; break ;;
+                *) echo 'Please answer yes or no (Enter defaults to No).' >&2 ;;
+            esac
+        done
+    fi
+
+    if [[ "$confirm" == n ]]; then
+        for ((attempt = 0; attempt < 100; attempt++)); do
+            if ! port=$(shuf -i 1024-62000 -n 1); then
+                echo 'Failed to generate a random panel port.' >&2
+                return 1
+            fi
+            if port=$(normalize_panel_port "$port") && ! is_port_in_use "$port"; then
+                echo "Generated random port: $port" >&2
+                printf '%s\n' "$port"
+                return 0
+            fi
+        done
+        echo 'Could not find an available random panel port; aborting.' >&2
+        return 1
+    fi
+
+    while true; do
+        if [[ "$NONINTERACTIVE" == 1 ]]; then
+            port="$XUI_PANEL_PORT"
+        elif ! read -rp 'Please set up the panel port: ' port; then
+            echo 'Cannot read the custom panel port; aborting.' >&2
+            return 1
+        fi
+        if ! port=$(normalize_panel_port "$port"); then
+            echo 'Invalid port. Enter a number between 1 and 65535.' >&2
+        elif is_port_in_use "$port"; then
+            echo "Port $port is already in use. Choose another panel port." >&2
+        else
+            echo "Your Panel Port is: $port" >&2
+            printf '%s\n' "$port"
+            return 0
+        fi
+        [[ "$NONINTERACTIVE" != 1 ]] || return 1
+    done
 }
 
 install_base() {
@@ -208,6 +276,60 @@ pg_ensure_hba_password_auth() {
     sudo -u postgres psql -tAc 'SELECT pg_reload_conf()' > /dev/null 2>&1 || true
 }
 
+# New installs get this PostgreSQL major from the official PGDG repository; distros or
+# CPU architectures PGDG does not build for fall back to the distribution's own package.
+PG_TARGET_MAJOR=18
+
+pg_has_debian_cluster() {
+    command -v pg_lsclusters > /dev/null 2>&1 && [[ -n "$(pg_lsclusters -h 2> /dev/null)" ]]
+}
+
+# Installs postgresql-${PG_TARGET_MAJOR} from apt.postgresql.org. On failure it removes the
+# repository it added, so an unsupported release cannot break later `apt-get update` runs.
+pg_apt_install_pgdg_server() {
+    local list added_lists=()
+    for list in /etc/apt/sources.list.d/pgdg.list /etc/apt/sources.list.d/pgdg.sources; do
+        [[ -e "${list}" ]] || added_lists+=("${list}")
+    done
+    if apt-get install -y -q postgresql-common ca-certificates gnupg >&2 \
+        && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >&2 \
+        && apt-get install -y -q "postgresql-${PG_TARGET_MAJOR}" >&2; then
+        return 0
+    fi
+    for list in "${added_lists[@]}"; do
+        rm -f "${list}"
+    done
+    apt-get update >&2 || true
+    echo -e "${yellow}PostgreSQL ${PG_TARGET_MAJOR} is not available for this system; installing the distribution's PostgreSQL instead.${plain}" >&2
+    return 1
+}
+
+# Installs postgresql${PG_TARGET_MAJOR}-server from the PGDG yum repository (EL 8+ only); on
+# failure it undoes the repository and module changes it made. The caller runs initdb.
+pg_el_install_pgdg_server() {
+    local elver
+    elver=$(rpm -E %rhel 2> /dev/null)
+    [[ "${elver}" =~ ^[0-9]+$ && "${elver}" -ge 8 ]] && command -v dnf > /dev/null 2>&1 || return 1
+    [[ -f /var/lib/pgsql/data/PG_VERSION ]] && return 1
+    local added_repo=false
+    if ! rpm -q pgdg-redhat-repo > /dev/null 2>&1; then
+        if dnf install -y -q "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${elver}-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm" >&2; then
+            added_repo=true
+            dnf -qy module disable postgresql > /dev/null 2>&1 || true
+        fi
+    fi
+    if rpm -q pgdg-redhat-repo > /dev/null 2>&1 \
+        && dnf install -y -q "postgresql${PG_TARGET_MAJOR}-server" "postgresql${PG_TARGET_MAJOR}-contrib" >&2; then
+        return 0
+    fi
+    if [[ "${added_repo}" == "true" ]]; then
+        dnf -qy module reset postgresql > /dev/null 2>&1 || true
+        dnf remove -y -q pgdg-redhat-repo >&2 || true
+    fi
+    echo -e "${yellow}PostgreSQL ${PG_TARGET_MAJOR} is not available for this system; installing the distribution's PostgreSQL instead.${plain}" >&2
+    return 1
+}
+
 install_postgres_local() {
     local pg_user pg_pass
     pg_pass=$(gen_random_string 24)
@@ -215,21 +337,27 @@ install_postgres_local() {
     local pg_host="127.0.0.1"
     local pg_port="5432"
 
+    local pg_service="postgresql"
     case "${release}" in
         ubuntu | debian | armbian)
-            apt-get update >&2 && apt-get install -y -q postgresql >&2 || return 1
-            ;;
-        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
-            dnf install -y -q postgresql-server postgresql-contrib >&2 || return 1
-            [[ -d /var/lib/pgsql/data && -f /var/lib/pgsql/data/PG_VERSION ]] || postgresql-setup --initdb >&2 || return 1
-            ;;
-        centos)
-            if [[ "${VERSION_ID}" =~ ^7 ]]; then
-                yum install -y postgresql-server postgresql-contrib >&2 || return 1
-            else
-                dnf install -y -q postgresql-server postgresql-contrib >&2 || return 1
+            apt-get update >&2 || return 1
+            if pg_has_debian_cluster || ! pg_apt_install_pgdg_server; then
+                apt-get install -y -q postgresql >&2 || return 1
             fi
-            [[ -d /var/lib/pgsql/data && -f /var/lib/pgsql/data/PG_VERSION ]] || postgresql-setup --initdb >&2 || return 1
+            ;;
+        fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol | centos)
+            if [[ "${release}" != "fedora" && "${release}" != "amzn" ]] && pg_el_install_pgdg_server; then
+                pg_service="postgresql-${PG_TARGET_MAJOR}"
+                [[ -f "/var/lib/pgsql/${PG_TARGET_MAJOR}/data/PG_VERSION" ]] \
+                    || "/usr/pgsql-${PG_TARGET_MAJOR}/bin/postgresql-${PG_TARGET_MAJOR}-setup" initdb >&2 || return 1
+            else
+                if [[ "${release}" == "centos" && "${VERSION_ID}" =~ ^7 ]]; then
+                    yum install -y postgresql-server postgresql-contrib >&2 || return 1
+                else
+                    dnf install -y -q postgresql-server postgresql-contrib >&2 || return 1
+                fi
+                [[ -d /var/lib/pgsql/data && -f /var/lib/pgsql/data/PG_VERSION ]] || postgresql-setup --initdb >&2 || return 1
+            fi
             ;;
         arch | manjaro | parch)
             pacman -Sy --noconfirm postgresql >&2 || return 1
@@ -259,7 +387,7 @@ install_postgres_local() {
     esac
 
     if [[ "${release}" != "alpine" ]]; then
-        systemctl enable --now postgresql >&2 || return 1
+        systemctl enable --now "${pg_service}" >&2 || return 1
     fi
 
     # Wait briefly for the server to accept connections.
@@ -1018,9 +1146,23 @@ prompt_and_setup_ssl() {
 }
 
 config_after_install() {
-    local existing_hasDefaultCredential=$(${xui_folder}/x-ui setting -show true | grep -Eo 'hasDefaultCredential: .+' | awk '{print $2}')
-    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}' | sed 's#^/##')
-    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
+    local settings existing_webBasePath
+    if ! settings=$("${xui_folder}/x-ui" setting -show true) ||
+        ! existing_webBasePath=$(printf '%s\n' "$settings" | awk '
+            /^get .* failed, error info:/ { failed = 1 }
+            /^hasDefaultCredential: (true|false)$/ { credentials++ }
+            /^port: [0-9]+$/ { ports++ }
+            /^webBasePath:/ { paths++; sub(/^webBasePath: ?/, ""); path = $0 }
+            END {
+                if (failed || credentials != 1 || ports != 1 || paths != 1 || (path != "" && path !~ /^\//)) exit 1
+                print path
+            }'); then
+        echo -e "${red}Unable to read webBasePath; leaving existing settings unchanged.${plain}" >&2
+        return 1
+    fi
+    existing_webBasePath=${existing_webBasePath#/}
+    local existing_hasDefaultCredential=$(printf '%s\n' "$settings" | awk '/^hasDefaultCredential: / {print $2}')
+    local existing_port=$(printf '%s\n' "$settings" | awk '/^port: / {print $2}')
     # Properly detect empty cert by checking if cert: line exists and has content after it
     local existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
     local URL_lists=(
@@ -1060,7 +1202,7 @@ config_after_install() {
         fi
     fi
 
-    if [[ ${#existing_webBasePath} -lt 4 ]]; then
+    if [[ -z "$existing_webBasePath" ]]; then
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
             local config_webBasePath="${XUI_WEB_BASE_PATH:-$(gen_random_string 18)}"
             local config_username="${XUI_USERNAME:-$(gen_random_string 10)}"
@@ -1195,26 +1337,20 @@ EOF
                 fi
             fi
 
-            if [[ "$NONINTERACTIVE" == "1" ]]; then
-                if [[ -n "${XUI_PANEL_PORT:-}" ]]; then
-                    config_port="${XUI_PANEL_PORT}"
-                    echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
-                else
-                    config_port=$(shuf -i 1024-62000 -n 1)
-                    echo -e "${yellow}Generated random port: ${config_port}${plain}"
-                fi
-            else
-                read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/n]: " config_confirm
-                if [[ "${config_confirm}" == "y" || "${config_confirm}" == "Y" ]]; then
-                    read -rp "Please set up the panel port: " config_port
-                    echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
-                else
-                    config_port=$(shuf -i 1024-62000 -n 1)
-                    echo -e "${yellow}Generated random port: ${config_port}${plain}"
-                fi
-            fi
+            config_port=$(select_panel_port) || exit 1
 
-            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
+            local settings_output settings_status=0
+            settings_output=$("${xui_folder}/x-ui" setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}" 2>&1) || settings_status=$?
+            printf '%s\n' "$settings_output"
+            # Released CLIs may print a settings/database error and still exit 0.
+            # Require all three existing success messages before claiming success.
+            if [[ "$settings_status" != 0 ]] ||
+                ! grep -Fxq "Port set successfully: ${config_port}" <<< "$settings_output" ||
+                ! grep -Fxq 'Username and password updated successfully' <<< "$settings_output" ||
+                ! grep -Fxq 'Base URI path set successfully' <<< "$settings_output"; then
+                echo 'Failed to configure panel settings; installation aborted.' >&2
+                exit 1
+            fi
 
             echo ""
             echo -e "${green}═══════════════════════════════════════════${plain}"
@@ -1228,7 +1364,7 @@ EOF
             prompt_and_setup_ssl "${config_port}" "${config_webBasePath}" "${server_ip}"
 
             # Retrieve the API token for display
-            local config_apiToken=$(${xui_folder}/x-ui setting -getApiToken true | grep -Eo 'apiToken: .+' | awk '{print $2}')
+            local config_apiToken=$(${xui_folder}/x-ui setting -getApiToken | grep -Eo 'apiToken: .+' | awk '{print $2}')
 
             # Display final credentials and access information
             echo ""
@@ -1288,7 +1424,7 @@ EOF
                 "${config_webBasePath}" "${SSL_SCHEME}" "${SSL_HOST}" "${config_apiToken}" "${db_type_out}"
         else
             local config_webBasePath=$(gen_random_string 18)
-            echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"
+            echo -e "${yellow}WebBasePath is missing or set to root. Generating a new one...${plain}"
             ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}"
             echo -e "${green}New WebBasePath: ${config_webBasePath}${plain}"
 
@@ -1322,7 +1458,7 @@ EOF
 
             # Persist a machine-parseable credentials file for cloud-init / MOTD.
             local config_apiToken
-            config_apiToken=$(${xui_folder}/x-ui setting -getApiToken true | grep -Eo 'apiToken: .+' | awk '{print $2}')
+            config_apiToken=$(${xui_folder}/x-ui setting -getApiToken | grep -Eo 'apiToken: .+' | awk '{print $2}')
             : "${SSL_SCHEME:=https}"
             : "${SSL_HOST:=${server_ip}}"
             write_install_result "${config_username}" "${config_password}" "${existing_port}" \
@@ -1384,6 +1520,169 @@ setup_fail2ban() {
     return 0
 }
 
+# Major version of the local systemd, 0 when it cannot be determined. The
+# SystemCallFilter=@system-service group only exists from systemd 239 on (other
+# @-named groups exist since 231); on older versions an unknown group is not
+# ignored safely, the filter stays in force and leaves a whitelist the panel
+# cannot run under.
+_xui_systemd_major_version() {
+    local version=""
+    if command -v systemctl > /dev/null 2>&1; then
+        version="$(systemctl --version 2>/dev/null | awk 'NR == 1 {print $2}')"
+    fi
+    if [[ ! "$version" =~ ^[0-9]+$ ]]; then
+        echo 0
+        return 0
+    fi
+    echo "$version"
+}
+
+# The shipped units list hardening that older systemd does not know: the
+# directive is logged and ignored at load time rather than rejected, so the
+# panel still starts, only without that protection. Each entry is the systemd
+# release that introduced the directive (systemd.exec(5)); everything else in
+# the unit predates the oldest systemd install.sh supports (CentOS 7 has 219).
+# SystemCallFilter= is listed because the drop-in only writes it from 239 on.
+_xui_warn_unsupported_hardening() {
+    local version entry missing=""
+    version="$(_xui_systemd_major_version)"
+    [[ "$version" -gt 0 ]] || return 0
+    for entry in RestrictRealtime:231 ReadWritePaths:231 ProtectKernelTunables:232 \
+        ProtectKernelModules:232 RestrictNamespaces:233 LockPersonality:235 \
+        SystemCallFilter:239 ProtectHostname:242 RestrictSUIDSGID:242 \
+        ProtectKernelLogs:244 ProtectClock:245; do
+        if [[ "$version" -lt "${entry##*:}" ]]; then
+            missing="${missing:+$missing, }${entry%%:*} (${entry##*:})"
+        fi
+    done
+    [[ -n "$missing" ]] || return 0
+    echo -e "${yellow}Note: systemd ${version} ignores part of the hardening in x-ui.service; the panel still starts.${plain}"
+    echo "      Not applied, needs a newer systemd: ${missing}."
+    if [[ "$version" -lt 231 ]]; then
+        echo "      The panel's folders stay writable through ReadWriteDirectories=, the alias this script installs."
+    fi
+    echo "      The rest of the hardening is in force. Upgrade systemd to apply the above."
+    return 0
+}
+
+# ProtectSystem=full makes /usr, /boot, /efi and /etc read-only. ProtectSystem=
+# strict would make the whole hierarchy read-only (only the kernel API
+# filesystems stay as they are), and that would break the panel's own use of
+# /tmp. The panel's stores are configurable (XUI_DB_FOLDER, XUI_LOG_FOLDER,
+# XUI_BIN_FOLDER), and XUI_MAIN_FOLDER is the folder install.sh/update.sh place
+# the files in -- the unit's WorkingDirectory on a stock install, and what a
+# relative XUI_BIN_FOLDER is resolved against. So a hard-coded list in the unit
+# either misses a relocated store -- the panel then cannot write its own SQLite
+# database and sits in a Restart=on-failure loop -- or forces the operator to
+# edit a file that every install/update overwrites from the release tarball.
+# install.sh and update.sh therefore regenerate the drop-in from the folders
+# actually in use, and the unit's own ReadWritePaths only carry the
+# plain-install defaults. A relocated store means re-running install or update:
+# the drop-in is only written here.
+_xui_service_write_paths_dropin() {
+    # $1 is the env file to resolve the XUI_* folders from; callers pass nothing
+    # and get the OS-specific path the unit itself uses.
+    local env_file="${1:-}"
+    local dropin_dir dropin temp_file
+    local db_folder log_folder bin_folder main_folder
+    local path line="" whitespace_paths="" seen_paths="" escaped_path
+
+    if [[ -z "$env_file" ]]; then
+        case "${release}" in
+            ubuntu | debian | armbian)
+                env_file="/etc/default/x-ui"
+                ;;
+            arch | manjaro | parch | alpine)
+                env_file="/etc/conf.d/x-ui"
+                ;;
+            *)
+                env_file="/etc/sysconfig/x-ui"
+                ;;
+        esac
+    fi
+    if [[ -r "$env_file" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$env_file"
+        set +a
+    fi
+
+    # XUI_* wins over the script's own default: the unit hands that same env
+    # file to the panel through EnvironmentFile=, so these are the folders it
+    # will actually use.
+    main_folder="${XUI_MAIN_FOLDER:-${xui_folder}}"
+    db_folder="${XUI_DB_FOLDER:-/etc/x-ui}"
+    log_folder="${XUI_LOG_FOLDER:-/var/log/x-ui}"
+    # An empty XUI_BIN_FOLDER resolves to "bin" relative to the panel's working
+    # directory, which the unit sets to the main folder.
+    bin_folder="${XUI_BIN_FOLDER:-bin}"
+    if [[ "$bin_folder" != /* ]]; then
+        bin_folder="${main_folder%/}/${bin_folder#./}"
+    fi
+
+    for path in "$db_folder" "$log_folder" "$bin_folder" "$main_folder"; do
+        [[ "$path" == /* ]] || continue
+        # ReadWritePaths= is a whitespace-separated list, and a folder whose
+        # name contains whitespace cannot be written into it without relying on
+        # quoting. A wrong entry makes systemd reject the whole drop-in and the
+        # panel would not start, so leave such a folder out and say so instead.
+        if [[ "$path" != "${path//[[:space:]]/}" ]]; then
+            whitespace_paths="${whitespace_paths:+$whitespace_paths }$path"
+            continue
+        fi
+        case " $seen_paths " in
+            *" $path "*) continue ;;
+        esac
+        seen_paths="${seen_paths}${seen_paths:+ }$path"
+        # systemd expands %-specifiers in unit files, so a folder name carrying
+        # a literal % has to be written as %%, or the entry stops naming the
+        # folder systemd is meant to keep writable.
+        escaped_path="${path//%/%%}"
+        line="${line} -${escaped_path}"
+    done
+    if [[ -n "$whitespace_paths" ]]; then
+        echo "Warning: these folders contain whitespace and were left out of" >&2
+        echo "         10-xui-sandbox.conf: $whitespace_paths" >&2
+        echo "         The panel cannot write to them under the unit's sandbox." >&2
+    fi
+    line="${line# }"
+    [[ -n "$line" ]] || return 1
+
+    dropin_dir="${xui_service}/x-ui.service.d"
+    dropin="${dropin_dir}/10-xui-sandbox.conf"
+    temp_file="${dropin}.tmp.$$"
+
+    mkdir -p "$dropin_dir" || return 1
+    cat > "$temp_file" << EOF
+# Regenerated by install.sh/update.sh on every install and update: edits here
+# are lost, and the list only reflects the XUI_* variables read from
+# ${env_file} at that moment. Re-run install/update after moving a store.
+# It lists the folders the panel writes to. Put local additions in their own
+# drop-in, for example 20-x-ui-local.conf, which nothing here touches.
+[Service]
+ReadWritePaths=${line}
+ReadWriteDirectories=${line}
+EOF
+    if [[ "$(_xui_systemd_major_version)" -ge 239 ]]; then
+        cat >> "$temp_file" << 'EOF'
+# @system-service needs systemd >= 239; on older versions the unknown group
+# would leave the panel with a filter it cannot start under (x-ui.service.*).
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+EOF
+    fi
+    if [[ ! -s "$temp_file" ]]; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    chmod 644 "$temp_file"
+    mv -f "$temp_file" "$dropin" || { rm -f "$temp_file"; return 1; }
+    if command -v systemctl > /dev/null 2>&1; then
+        systemctl daemon-reload > /dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # Lands a systemd unit file at ${xui_service}/x-ui.service via a temp file +
 # atomic mv, so a failed cp/curl or an interrupted mv never leaves a
 # truncated unit file at the live path -- systemd would then fail to parse
@@ -1415,6 +1714,11 @@ _install_xui_service_unit() {
         rm -f "$temp_file"
         return 1
     fi
+    if ! _xui_service_write_paths_dropin; then
+        echo -e "${yellow}Warning: could not refresh ${xui_service}/x-ui.service.d/10-xui-sandbox.conf.${plain}"
+        echo -e "${yellow}If XUI_DB_FOLDER or XUI_LOG_FOLDER points outside /etc/x-ui and /var/log/x-ui, the panel may not be able to write to it under ProtectSystem=full.${plain}"
+    fi
+    _xui_warn_unsupported_hardening
     return 0
 }
 
@@ -1570,6 +1874,7 @@ install_x-ui() {
         # an inbound port with an outdated secret, silently breaking new clients.
         # The freshly installed panel respawns a clean mtg per inbound on start.
         pkill -f 'mtg-linux-[^ ]* run ' > /dev/null 2>&1 || true
+        pkill -f 'tuic-server.*-c .*bin/tuic/tuic_[0-9]+\.json' > /dev/null 2>&1 || true
 
         # bin/ is about to be wiped wholesale by the tar extraction below. The
         # release only ships known assets (xray/mtg binaries, the bundled
@@ -1652,7 +1957,7 @@ install_x-ui() {
         while IFS= read -r -d '' f; do
             local rel="${f#"${custom_bin_backup}"/}"
             case "${rel}" in
-                config.json | mtproto | mtproto/*) continue ;;
+                config.json | mtproto | mtproto/* | tuic | tuic/* | tuic-server | tuic-server-*) continue ;;
             esac
             if [[ ! -e "bin/${rel}" ]]; then
                 mkdir -p "bin/$(dirname "${rel}")"
@@ -1667,6 +1972,9 @@ install_x-ui() {
         fi
     fi
     trap - EXIT INT TERM
+
+    rm -f bin/tuic-server bin/tuic-server-* > /dev/null 2>&1 || true
+    rm -rf bin/tuic > /dev/null 2>&1 || true
 
     # Update x-ui cli and se set permission
     mv -f "${xui_script_temp}" /usr/bin/x-ui

@@ -2,47 +2,45 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ComponentType, CSSProperties } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Drawer, Layout, Menu } from 'antd';
+import { Drawer, Layout, Menu, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
 import {
-  ApiOutlined,
   ApartmentOutlined,
   CloseOutlined,
   CloudServerOutlined,
   ClusterOutlined,
   CodeOutlined,
-  DashboardOutlined,
   DatabaseOutlined,
-  ExportOutlined,
+  DiscordOutlined,
   GithubOutlined,
-  GlobalOutlined,
   HeartOutlined,
-  ImportOutlined,
   LogoutOutlined,
   MailOutlined,
   MenuOutlined,
-  MessageOutlined,
   MoonFilled,
   MoonOutlined,
   PushpinFilled,
   PushpinOutlined,
   ReadOutlined,
   SafetyOutlined,
+  SearchOutlined,
   SettingOutlined,
   SunOutlined,
-  SwapOutlined,
-  TagsOutlined,
-  TeamOutlined,
-  ToolOutlined,
+  TelegramFilled,
 } from '@ant-design/icons';
 
 import { HttpUtil } from '@/utils';
 import { formatPanelVersion } from '@/lib/panel-version';
 import { pauseAnimationsUntilLeave, useTheme } from '@/hooks/useTheme';
 import { useAllSettings } from '@/api/queries/useAllSettings';
+import { useCommandPalette } from '@/components/command-palette/useCommandPalette';
+import { PANEL_ROUTES } from '@/routes/panelRoutes';
 import './AppSidebar.css';
 
 const DONATE_URL = 'https://donate.sanaei.dev/';
+// The palette listens for Ctrl as well as Cmd, so the chip must not show a
+// Mac glyph to the Linux and Windows operators who are most of this panel's.
+const SHORTCUT_MODIFIER = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent) ? '⌘' : 'Ctrl';
 const DOCS_URL = 'https://docs.sanaei.dev/';
 const REPO_URL = 'https://github.com/MHSanaei/3x-ui';
 const LOGOUT_KEY = '__logout__';
@@ -51,35 +49,6 @@ const SIDER_WIDTH = 220;
 const SIDEBAR_PINNED_KEY = 'sidebar-pinned';
 
 let hoveredAcrossRemounts = false;
-
-type IconName =
-  | 'dashboard'
-  | 'inbound'
-  | 'team'
-  | 'groups'
-  | 'setting'
-  | 'tool'
-  | 'cluster'
-  | 'hosts'
-  | 'logout'
-  | 'apidocs'
-  | 'outbound'
-  | 'routing';
-
-const iconByName: Record<IconName, ComponentType> = {
-  dashboard: DashboardOutlined,
-  inbound: ImportOutlined,
-  team: TeamOutlined,
-  groups: TagsOutlined,
-  setting: SettingOutlined,
-  tool: ToolOutlined,
-  cluster: ClusterOutlined,
-  hosts: GlobalOutlined,
-  logout: LogoutOutlined,
-  apidocs: ApiOutlined,
-  outbound: ExportOutlined,
-  routing: SwapOutlined,
-};
 
 function DonateButton({ ariaLabel }: { ariaLabel: string }) {
   return (
@@ -91,7 +60,7 @@ function DonateButton({ ariaLabel }: { ariaLabel: string }) {
       aria-label={ariaLabel}
       title={ariaLabel}
     >
-      <HeartOutlined />
+      <HeartOutlined aria-hidden />
     </a>
   );
 }
@@ -106,7 +75,7 @@ function DocsButton({ ariaLabel }: { ariaLabel: string }) {
       aria-label={ariaLabel}
       title={ariaLabel}
     >
-      <ReadOutlined />
+      <ReadOutlined aria-hidden />
     </a>
   );
 }
@@ -123,7 +92,7 @@ function VersionBadge({ version, collapsed }: { version: string; collapsed?: boo
       aria-label={`GitHub ${label}`}
       title={label}
     >
-      <GithubOutlined />
+      <GithubOutlined aria-hidden />
       {!collapsed && <span className="sider-version-text">{label}</span>}
     </a>
   );
@@ -142,7 +111,13 @@ function ThemeCycleButton({
   onCycle: () => void;
   ariaLabel: string;
 }) {
-  const icon = !isDark ? <SunOutlined /> : !isUltra ? <MoonOutlined /> : <MoonFilled />;
+  const icon = !isDark ? (
+    <SunOutlined aria-hidden />
+  ) : !isUltra ? (
+    <MoonOutlined aria-hidden />
+  ) : (
+    <MoonFilled aria-hidden />
+  );
   return (
     <button
       id={id}
@@ -174,6 +149,7 @@ function saveSidebarPinned(pinned: boolean) {
 export default function AppSidebar() {
   const { t } = useTranslation();
   const { isDark, isUltra, toggleTheme, toggleUltra } = useTheme();
+  const { open: openCommandPalette } = useCommandPalette();
   const navigate = useNavigate();
   const { pathname, hash } = useLocation();
   const { allSetting } = useAllSettings();
@@ -212,62 +188,65 @@ export default function AppSidebar() {
   const currentTheme: 'light' | 'dark' = isDark ? 'dark' : 'light';
   const panelVersion = window.X_UI_CUR_VER || '';
 
-  const tabs = useMemo<{ key: string; icon: IconName; title: string }[]>(
+  const tabs = useMemo<{ key: string; icon: ComponentType; title: string }[]>(
     () => [
-      { key: '/', icon: 'dashboard', title: t('menu.dashboard') },
-      { key: '/inbounds', icon: 'inbound', title: t('menu.inbounds') },
-      { key: '/clients', icon: 'team', title: t('menu.clients') },
-      { key: '/groups', icon: 'groups', title: t('menu.groups') },
-      { key: '/nodes', icon: 'cluster', title: t('menu.nodes') },
-      { key: '/hosts', icon: 'hosts', title: t('menu.hosts') },
-      { key: '/outbound', icon: 'outbound', title: t('menu.outbounds') },
-      { key: '/routing', icon: 'routing', title: t('menu.routing') },
-      { key: '/settings', icon: 'setting', title: t('menu.settings') },
-      { key: '/xray', icon: 'tool', title: t('menu.xray') },
-      { key: '/api-docs', icon: 'apidocs', title: t('menu.apiDocs') },
-      { key: LOGOUT_KEY, icon: 'logout', title: t('logout') },
+      ...PANEL_ROUTES.map((route) => ({
+        key: route.path,
+        icon: route.icon,
+        title: t(route.titleKey),
+      })),
+      { key: LOGOUT_KEY, icon: LogoutOutlined, title: t('logout') },
     ],
     [t],
   );
 
-  const navItems = useMemo(() => tabs.filter((tab) => tab.icon !== 'logout'), [tabs]);
-  const utilItems = useMemo(() => tabs.filter((tab) => tab.icon === 'logout'), [tabs]);
+  const navItems = useMemo(() => tabs.filter((tab) => tab.key !== LOGOUT_KEY), [tabs]);
+  const utilItems = useMemo(() => tabs.filter((tab) => tab.key === LOGOUT_KEY), [tabs]);
 
   const settingsChildren = useMemo<NonNullable<MenuProps['items']>>(() => {
     const children: NonNullable<MenuProps['items']> = [
       {
         key: '/settings#general',
-        icon: <SettingOutlined />,
+        icon: <SettingOutlined aria-hidden />,
         label: t('pages.settings.panelSettings'),
       },
       {
         key: '/settings#security',
-        icon: <SafetyOutlined />,
+        icon: <SafetyOutlined aria-hidden />,
         label: t('pages.settings.securitySettings'),
       },
       {
         key: '/settings#telegram',
-        icon: <MessageOutlined />,
+        icon: <TelegramFilled aria-hidden />,
         label: t('pages.settings.TGBotSettings'),
       },
-      { key: '/settings#email', icon: <MailOutlined />, label: t('pages.settings.emailSettings') },
+      {
+        key: '/settings#email',
+        icon: <MailOutlined aria-hidden />,
+        label: t('pages.settings.emailSettings'),
+      },
+      {
+        key: '/settings#discord',
+        icon: <DiscordOutlined aria-hidden />,
+        label: t('pages.settings.discordSettings'),
+      },
       {
         key: '/settings#subscription',
-        icon: <CloudServerOutlined />,
+        icon: <CloudServerOutlined aria-hidden />,
         label: t('pages.settings.subSettings'),
       },
     ];
     if (showSubFormats) {
       children.push({
         key: '/settings#subscription-formats',
-        icon: <CodeOutlined />,
+        icon: <CodeOutlined aria-hidden />,
         label: t('menu.subFormats'),
       });
     }
     if (showSubBalancers) {
       children.push({
         key: '/settings#subscription-balancers',
-        icon: <ApartmentOutlined />,
+        icon: <ApartmentOutlined aria-hidden />,
         label: t('pages.settings.subBalancers.menu'),
       });
     }
@@ -276,10 +255,22 @@ export default function AppSidebar() {
 
   const xrayChildren = useMemo<NonNullable<MenuProps['items']>>(
     () => [
-      { key: '/xray#basic', icon: <SettingOutlined />, label: t('pages.xray.basicTemplate') },
-      { key: '/xray#balancer', icon: <ClusterOutlined />, label: t('pages.xray.Balancers') },
-      { key: '/xray#dns', icon: <DatabaseOutlined />, label: 'DNS' },
-      { key: '/xray#advanced', icon: <CodeOutlined />, label: t('pages.xray.advancedTemplate') },
+      {
+        key: '/xray#basic',
+        icon: <SettingOutlined aria-hidden />,
+        label: t('pages.xray.basicTemplate'),
+      },
+      {
+        key: '/xray#balancer',
+        icon: <ClusterOutlined aria-hidden />,
+        label: t('pages.xray.Balancers'),
+      },
+      { key: '/xray#dns', icon: <DatabaseOutlined aria-hidden />, label: 'DNS' },
+      {
+        key: '/xray#advanced',
+        icon: <CodeOutlined aria-hidden />,
+        label: t('pages.xray.advancedTemplate'),
+      },
     ],
     [t],
   );
@@ -303,14 +294,24 @@ export default function AppSidebar() {
   const toMenuItems = useCallback(
     (items: typeof tabs): MenuProps['items'] =>
       items.map((tab) => {
-        const Icon = iconByName[tab.icon];
+        const Icon = tab.icon;
         if (tab.key === '/settings') {
-          return { key: tab.key, icon: <Icon />, label: tab.title, children: settingsChildren };
+          return {
+            key: tab.key,
+            icon: <Icon aria-hidden />,
+            label: tab.title,
+            children: settingsChildren,
+          };
         }
         if (tab.key === '/xray') {
-          return { key: tab.key, icon: <Icon />, label: tab.title, children: xrayChildren };
+          return {
+            key: tab.key,
+            icon: <Icon aria-hidden />,
+            label: tab.title,
+            children: xrayChildren,
+          };
         }
-        return { key: tab.key, icon: <Icon />, label: tab.title, title: '' };
+        return { key: tab.key, icon: <Icon aria-hidden />, label: tab.title, title: '' };
       }),
     [settingsChildren, xrayChildren],
   );
@@ -378,7 +379,7 @@ export default function AppSidebar() {
                 title={t(pinned ? 'menu.unpinSidebar' : 'menu.pinSidebar')}
                 onClick={togglePinned}
               >
-                {pinned ? <PushpinFilled /> : <PushpinOutlined />}
+                {pinned ? <PushpinFilled aria-hidden /> : <PushpinOutlined aria-hidden />}
               </button>
               <DocsButton ariaLabel={t('menu.docs') || 'Documentation'} />
               <DonateButton ariaLabel={t('menu.donate') || 'Donate'} />
@@ -392,6 +393,30 @@ export default function AppSidebar() {
             </div>
           )}
         </div>
+        <Tooltip
+          title={
+            railCollapsed ? t('commandPalette.title') || 'Command Palette (Ctrl + K)' : undefined
+          }
+          placement="right"
+        >
+          <button
+            type="button"
+            className={`sidebar-command-trigger${railCollapsed ? ' collapsed' : ''}`}
+            onClick={openCommandPalette}
+            aria-label={t('commandPalette.title') || 'Command Palette (Ctrl + K)'}
+          >
+            <span className="sidebar-command-left">
+              <SearchOutlined aria-hidden className="sidebar-command-icon" />
+              <span className="sidebar-command-text">
+                {t('commandPalette.search') || 'Search...'}
+              </span>
+            </span>
+            <span className="sidebar-command-kbd">
+              <span className="kbd-cmd">{SHORTCUT_MODIFIER}</span>
+              <span className="kbd-key">K</span>
+            </span>
+          </button>
+        </Tooltip>
         <Menu
           theme={currentTheme}
           mode="inline"
@@ -448,10 +473,29 @@ export default function AppSidebar() {
               aria-label={t('close')}
               onClick={() => setDrawerOpen(false)}
             >
-              <CloseOutlined />
+              <CloseOutlined aria-hidden />
             </button>
           </div>
         </div>
+        <button
+          type="button"
+          className="sidebar-command-trigger"
+          onClick={() => {
+            setDrawerOpen(false);
+            openCommandPalette();
+          }}
+          aria-label={t('commandPalette.title') || 'Command Palette (Ctrl + K)'}
+          style={{ margin: '8px 12px 4px', width: 'calc(100% - 24px)' }}
+        >
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <SearchOutlined aria-hidden className="sidebar-command-icon" />
+            <span>{t('commandPalette.search') || 'Search...'}</span>
+          </span>
+          <span className="sidebar-command-kbd">
+            <span className="kbd-cmd">{SHORTCUT_MODIFIER}</span>
+            <span className="kbd-key">K</span>
+          </span>
+        </button>
         <Menu
           theme={currentTheme}
           mode="inline"
@@ -488,7 +532,7 @@ export default function AppSidebar() {
           aria-label={t('menu.openMenu')}
           onClick={() => setDrawerOpen(true)}
         >
-          <MenuOutlined />
+          <MenuOutlined aria-hidden />
         </button>
       )}
     </div>

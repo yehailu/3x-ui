@@ -58,6 +58,10 @@ type Instance struct {
 	// fair-share algorithm; zero disables throttling.
 	ThrottleMaxConnections int
 
+	// PendingHandshakesMaxPerIP caps unauthenticated handshakes held open by one
+	// client IP (mtg-multi >= 1.16.0); zero leaves the limit off.
+	PendingHandshakesMaxPerIP int
+
 	// PublicIPv4/PublicIPv6 pin the proxy's reachable address the Telegram
 	// middle proxy needs when clients carry advertising tags; they are omitted
 	// when empty so mtg auto-detects, and a change forces a restart.
@@ -93,6 +97,7 @@ func (inst Instance) structuralFingerprint() string {
 		strconv.Itoa(inst.FrontingPort),
 		strconv.FormatBool(inst.FrontingProxyProtocol),
 		strconv.Itoa(inst.ThrottleMaxConnections),
+		strconv.Itoa(inst.PendingHandshakesMaxPerIP),
 		strconv.FormatBool(inst.RouteThroughXray),
 		strconv.Itoa(inst.XrayRoutePort),
 		inst.PublicIPv4,
@@ -164,8 +169,9 @@ func GetManager() *Manager {
 // InstanceFromInbound derives a desired Instance from an mtproto inbound,
 // building one named secret per active client. Secrets are healed on save (see
 // normalizeMtprotoSecret) and by the migration, so they are read as-is here to
-// keep the fingerprint stable across reconciles. Returns false when the inbound
-// is not a usable mtproto inbound or has no active client secret to serve.
+// keep the fingerprint stable across reconciles; a client whose stored values
+// mtg could not parse is left out (see usableAdTag). Returns false when the
+// inbound is not a usable mtproto inbound or has no active client secret to serve.
 func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 	if ib == nil || ib.Protocol != model.MTProto {
 		return Instance{}, false
@@ -179,13 +185,14 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 			Port          int    `json:"port"`
 			ProxyProtocol bool   `json:"proxyProtocol"`
 		} `json:"domainFronting"`
-		PreferIP               string `json:"preferIp"`
-		ThrottleMaxConnections int    `json:"throttleMaxConnections"`
-		RouteThroughXray       bool   `json:"routeThroughXray"`
-		RouteXrayPort          int    `json:"routeXrayPort"`
-		PublicIPv4             string `json:"publicIpv4"`
-		PublicIPv6             string `json:"publicIpv6"`
-		Clients                []struct {
+		PreferIP                  string `json:"preferIp"`
+		ThrottleMaxConnections    int    `json:"throttleMaxConnections"`
+		PendingHandshakesMaxPerIP int    `json:"pendingHandshakesMaxPerIp"`
+		RouteThroughXray          bool   `json:"routeThroughXray"`
+		RouteXrayPort             int    `json:"routeXrayPort"`
+		PublicIPv4                string `json:"publicIpv4"`
+		PublicIPv6                string `json:"publicIpv6"`
+		Clients                   []struct {
 			Email      string `json:"email"`
 			Secret     string `json:"secret"`
 			AdTag      string `json:"adTag"`
@@ -199,15 +206,15 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 	}
 	secrets := make([]SecretEntry, 0, len(parsed.Clients))
 	for _, c := range parsed.Clients {
-		if !c.Enable || c.Secret == "" || c.Email == "" {
+		if !c.Enable || c.Email == "" || !model.ValidMtprotoSecret(c.Secret) {
 			continue
 		}
 		entry := SecretEntry{Name: c.Email, Secret: c.Secret, AdTag: usableAdTag(c.AdTag)}
 		if c.TotalGB > 0 {
-			entry.QuotaBytes = c.TotalGB
+			entry.QuotaBytes = min(c.TotalGB, maxQuotaBytes)
 		}
 		if c.ExpiryTime > 0 {
-			entry.ExpiresUnix = c.ExpiryTime / 1000
+			entry.ExpiresUnix = min(c.ExpiryTime/1000, maxExpiresUnix)
 		}
 		secrets = append(secrets, entry)
 	}
@@ -215,22 +222,23 @@ func InstanceFromInbound(ib *model.Inbound) (Instance, bool) {
 		return Instance{}, false
 	}
 	return Instance{
-		Id:                     ib.Id,
-		Tag:                    ib.Tag,
-		Listen:                 ib.Listen,
-		Port:                   ib.Port,
-		Secrets:                secrets,
-		Debug:                  parsed.Debug,
-		ProxyProtocolListener:  parsed.ProxyProtocolListener,
-		PreferIP:               parsed.PreferIP,
-		FrontingIP:             parsed.DomainFronting.IP,
-		FrontingPort:           parsed.DomainFronting.Port,
-		FrontingProxyProtocol:  parsed.DomainFronting.ProxyProtocol,
-		ThrottleMaxConnections: parsed.ThrottleMaxConnections,
-		RouteThroughXray:       parsed.RouteThroughXray,
-		XrayRoutePort:          parsed.RouteXrayPort,
-		PublicIPv4:             strings.TrimSpace(parsed.PublicIPv4),
-		PublicIPv6:             strings.TrimSpace(parsed.PublicIPv6),
+		Id:                        ib.Id,
+		Tag:                       ib.Tag,
+		Listen:                    ib.Listen,
+		Port:                      ib.Port,
+		Secrets:                   secrets,
+		Debug:                     parsed.Debug,
+		ProxyProtocolListener:     parsed.ProxyProtocolListener,
+		PreferIP:                  parsed.PreferIP,
+		FrontingIP:                parsed.DomainFronting.IP,
+		FrontingPort:              parsed.DomainFronting.Port,
+		FrontingProxyProtocol:     parsed.DomainFronting.ProxyProtocol,
+		ThrottleMaxConnections:    parsed.ThrottleMaxConnections,
+		PendingHandshakesMaxPerIP: parsed.PendingHandshakesMaxPerIP,
+		RouteThroughXray:          parsed.RouteThroughXray,
+		XrayRoutePort:             parsed.RouteXrayPort,
+		PublicIPv4:                strings.TrimSpace(parsed.PublicIPv4),
+		PublicIPv6:                strings.TrimSpace(parsed.PublicIPv6),
 	}, true
 }
 
@@ -245,6 +253,13 @@ func usableAdTag(tag string) string {
 	}
 	return tag
 }
+
+// The largest limits mtg parses: its byte parser overflows just short of
+// MaxInt64 and RFC 3339 ends with the year 9999. Larger stored values are capped.
+const (
+	maxQuotaBytes  = int64(9_000_000_000_000_000_000)
+	maxExpiresUnix = int64(253402300799)
+)
 
 // Ensure starts the mtg process for an instance, or restarts it when its
 // configuration changed. A no-op when the desired process is already running.
@@ -523,7 +538,7 @@ func FreeLocalPort() (int, error) {
 // precede any [section] header in TOML, and [secrets] must be the final section
 // so trailing keys are not swallowed by another table. The layout is therefore:
 // top-level scalars (incl. api-bind-to and api-token), then [domain-fronting],
-// [network] and [throttle], then [secret-ad-tags] for clients overriding the
+// [network], [throttle] and [defense.pending-handshakes], then [secret-ad-tags] for clients overriding the
 // global advertising tag, and finally [secrets] with one named secret per
 // active client.
 func renderConfig(inst Instance, apiPort int, apiToken string) string {
@@ -568,6 +583,9 @@ func renderConfig(inst Instance, apiPort int, apiToken string) string {
 	}
 	if inst.ThrottleMaxConnections > 0 {
 		fmt.Fprintf(&b, "\n[throttle]\nmax-connections = %d\n", inst.ThrottleMaxConnections)
+	}
+	if inst.PendingHandshakesMaxPerIP > 0 {
+		fmt.Fprintf(&b, "\n[defense.pending-handshakes]\nmax-per-ip = %d\n", inst.PendingHandshakesMaxPerIP)
 	}
 	// Only clients present in [secrets] may appear here: mtg rejects a config
 	// whose [secret-ad-tags] names an unknown secret, so a disabled client's

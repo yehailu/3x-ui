@@ -3,11 +3,11 @@
 package locale
 
 import (
-	"embed"
 	"encoding/json"
 	"io/fs"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 
@@ -16,10 +16,11 @@ import (
 	"golang.org/x/text/language"
 )
 
+// Each is published whole: InitLocalizer runs again (Telegram bot start) while requests read them.
 var (
-	i18nBundle   *i18n.Bundle
-	LocalizerWeb *i18n.Localizer
-	LocalizerBot *i18n.Localizer
+	i18nBundle   atomic.Pointer[i18n.Bundle]
+	localizerWeb atomic.Pointer[i18n.Localizer]
+	localizerBot atomic.Pointer[i18n.Localizer]
 )
 
 // I18nType represents the type of interface for internationalization.
@@ -36,15 +37,16 @@ type SettingService interface {
 }
 
 // InitLocalizer initializes the internationalization system with embedded translation files.
-func InitLocalizer(i18nFS embed.FS, settingService SettingService) error {
+func InitLocalizer(i18nFS fs.FS, settingService SettingService) error {
 	// set default bundle to English
-	i18nBundle = i18n.NewBundle(language.MustParse("en-US"))
-	i18nBundle.RegisterUnmarshalFunc("json", json.Unmarshal)
+	bundle := i18n.NewBundle(language.MustParse("en-US"))
+	bundle.RegisterUnmarshalFunc("json", json.Unmarshal)
 
 	// parse files
-	if err := parseTranslationFiles(i18nFS, i18nBundle); err != nil {
+	if err := parseTranslationFiles(i18nFS, bundle); err != nil {
 		return err
 	}
+	i18nBundle.Store(bundle)
 
 	// setup bot locale
 	if err := initTGBotLocalizer(settingService); err != nil {
@@ -78,9 +80,9 @@ func I18n(i18nType I18nType, key string, params ...string) string {
 
 	switch i18nType {
 	case "bot":
-		localizer = LocalizerBot
+		localizer = localizerBot.Load()
 	case "web":
-		localizer = LocalizerWeb
+		localizer = localizerWeb.Load()
 	default:
 		logger.Errorf("Invalid type for I18n: %s", i18nType)
 		return ""
@@ -105,6 +107,32 @@ func I18n(i18nType I18nType, key string, params ...string) string {
 	return msg
 }
 
+// LocalizerFor returns a new Localizer for the given language tag using the global bundle.
+func LocalizerFor(lang string) *i18n.Localizer {
+	bundle := i18nBundle.Load()
+	if bundle == nil {
+		return nil
+	}
+	return i18n.NewLocalizer(bundle, lang)
+}
+
+// I18nForLang retrieves a localized message for a specific language tag with optional params.
+func I18nForLang(lang string, key string, params ...string) string {
+	loc := LocalizerFor(lang)
+	if loc == nil {
+		return key
+	}
+	templateData := createTemplateData(params)
+	msg, err := loc.Localize(&i18n.LocalizeConfig{
+		MessageID:    key,
+		TemplateData: templateData,
+	})
+	if err != nil {
+		return key
+	}
+	return msg
+}
+
 // initTGBotLocalizer initializes the bot localizer with the configured language.
 func initTGBotLocalizer(settingService SettingService) error {
 	botLang, err := settingService.GetTgLang()
@@ -112,7 +140,7 @@ func initTGBotLocalizer(settingService SettingService) error {
 		return err
 	}
 
-	LocalizerBot = i18n.NewLocalizer(i18nBundle, botLang)
+	localizerBot.Store(i18n.NewLocalizer(i18nBundle.Load(), botLang))
 	return nil
 }
 
@@ -123,12 +151,16 @@ func initTGBotLocalizer(settingService SettingService) error {
 func LocalizerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Ensure bundle is initialized so creating a Localizer won't panic
-		if i18nBundle == nil {
-			i18nBundle = i18n.NewBundle(language.MustParse("en-US"))
-			i18nBundle.RegisterUnmarshalFunc("json", json.Unmarshal)
+		bundle := i18nBundle.Load()
+		if bundle == nil {
+			bundle = i18n.NewBundle(language.MustParse("en-US"))
+			bundle.RegisterUnmarshalFunc("json", json.Unmarshal)
 			// Try lazy-load from disk when running sub server without InitLocalizer
-			if err := loadTranslationsFromDisk(i18nBundle); err != nil {
+			if err := loadTranslationsFromDisk(bundle); err != nil {
 				logger.Warning("i18n lazy load failed:", err)
+			}
+			if !i18nBundle.CompareAndSwap(nil, bundle) {
+				bundle = i18nBundle.Load()
 			}
 		}
 		var lang string
@@ -139,9 +171,10 @@ func LocalizerMiddleware() gin.HandlerFunc {
 			lang = c.GetHeader("Accept-Language")
 		}
 
-		LocalizerWeb = i18n.NewLocalizer(i18nBundle, lang)
+		localizer := i18n.NewLocalizer(bundle, lang)
+		localizerWeb.Store(localizer)
 
-		c.Set("localizer", LocalizerWeb)
+		c.Set("localizer", localizer)
 		c.Set("I18n", I18n)
 		c.Next()
 	}
@@ -167,7 +200,7 @@ func loadTranslationsFromDisk(bundle *i18n.Bundle) error {
 }
 
 // parseTranslationFiles parses embedded translation files and adds them to the i18n bundle.
-func parseTranslationFiles(i18nFS embed.FS, i18nBundle *i18n.Bundle) error {
+func parseTranslationFiles(i18nFS fs.FS, i18nBundle *i18n.Bundle) error {
 	err := fs.WalkDir(i18nFS, "translation",
 		func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -178,7 +211,7 @@ func parseTranslationFiles(i18nFS embed.FS, i18nBundle *i18n.Bundle) error {
 				return nil
 			}
 
-			data, err := i18nFS.ReadFile(path)
+			data, err := fs.ReadFile(i18nFS, path)
 			if err != nil {
 				return err
 			}
@@ -191,4 +224,9 @@ func parseTranslationFiles(i18nFS embed.FS, i18nBundle *i18n.Bundle) error {
 	}
 
 	return nil
+}
+
+// SwapBotLocalizer installs l as the bot localizer and returns the previous one.
+func SwapBotLocalizer(l *i18n.Localizer) *i18n.Localizer {
+	return localizerBot.Swap(l)
 }

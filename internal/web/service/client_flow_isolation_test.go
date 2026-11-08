@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
@@ -25,9 +26,8 @@ func TestClientWithInboundFlow_GatesByInboundCapability(t *testing.T) {
 		{"vless tcp none clears flow", model.VLESS, `{"network":"tcp","security":"none"}`, "", ""},
 		{"vmess tcp tls clears flow", model.VMESS, `{"network":"tcp","security":"tls"}`, "", ""},
 		{"empty stream clears flow", model.VLESS, "", "", ""},
-		// vlessenc (ML-KEM) keeps Vision flow without transport TLS only on XHTTP.
-		// TCP without tls/reality clears it even with vlessenc set.
-		{"vless tcp vlessenc clears flow", model.VLESS, `{"network":"tcp","security":"none"}`, enc, ""},
+		// vlessenc (ML-KEM) carries Vision without transport TLS on any transport.
+		{"vless tcp vlessenc keeps flow", model.VLESS, `{"network":"tcp","security":"none"}`, enc, vision},
 		{"vless xhttp vlessenc keeps flow", model.VLESS, `{"network":"xhttp","security":"none"}`, enc, vision},
 		{"vless xhttp no encryption clears flow", model.VLESS, `{"network":"xhttp","security":"none"}`, `{"encryption":"none"}`, ""},
 		{"vless xhttp empty settings clears flow", model.VLESS, `{"network":"xhttp","security":"none"}`, "", ""},
@@ -46,10 +46,7 @@ func TestClientWithInboundFlow_GatesByInboundCapability(t *testing.T) {
 func TestFlowIsolation_VisionDoesNotLeakToWsInbound(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -95,10 +92,7 @@ func TestFlowIsolation_VisionDoesNotLeakToWsInbound(t *testing.T) {
 func TestEffectiveFlow_NonFlowInboundSyncedLastDoesNotHideVision(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 	reality := &model.Inbound{Tag: "vless-reality", Enable: true, Port: 40001, Protocol: model.VLESS, StreamSettings: `{"network":"tcp","security":"reality"}`}
@@ -145,10 +139,7 @@ func TestEffectiveFlow_NonFlowInboundSyncedLastDoesNotHideVision(t *testing.T) {
 func TestEffectiveFlow_ClearedFlowStaysCleared(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 	reality := &model.Inbound{Tag: "vless-reality", Enable: true, Port: 41001, Protocol: model.VLESS, StreamSettings: `{"network":"tcp","security":"reality"}`}
@@ -191,10 +182,7 @@ func TestEffectiveFlow_ClearedFlowStaysCleared(t *testing.T) {
 func TestAttach_PreservesVisionFlowWhenCanonicalColumnZeroed(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -261,5 +249,110 @@ func TestAttach_PreservesVisionFlowWhenCanonicalColumnZeroed(t *testing.T) {
 	}
 	if len(wsList) != 1 || wsList[0].Flow != "" {
 		t.Errorf("attached non-flow inbound must not receive Vision flow, got %#v", wsList)
+	}
+}
+
+func TestBulkAttach_PreservesVisionFlowWhenCanonicalColumnZeroed(t *testing.T) {
+	dbDir := t.TempDir()
+	t.Setenv("XUI_DB_FOLDER", dbDir)
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
+
+	db := database.GetDB()
+
+	const email = "vision-bulk@example.com"
+	const uid = "ce8d33df-3a64-4f10-8f9b-91c3a8e0c222"
+	const sub = "subvisionbulk0001"
+	const vision = "xtls-rprx-vision"
+	const realityStream = `{"network":"tcp","security":"reality"}`
+
+	svc := ClientService{}
+	source := model.Client{Email: email, ID: uid, SubID: sub, Enable: true, Flow: vision}
+
+	reality1 := &model.Inbound{
+		Tag: "vless-reality-bulk-1", Enable: true, Port: 42101, Protocol: model.VLESS,
+		StreamSettings: realityStream,
+		Settings:       clientsSettings(t, []model.Client{source}),
+	}
+	if err := db.Create(reality1).Error; err != nil {
+		t.Fatalf("create reality1: %v", err)
+	}
+	reality2 := &model.Inbound{
+		Tag: "vless-reality-bulk-2", Enable: true, Port: 42102, Protocol: model.VLESS,
+		StreamSettings: realityStream, Settings: `{"clients":[]}`,
+	}
+	if err := db.Create(reality2).Error; err != nil {
+		t.Fatalf("create reality2: %v", err)
+	}
+	wsTls := &model.Inbound{
+		Tag: "vless-ws-bulk", Enable: true, Port: 42103, Protocol: model.VLESS,
+		StreamSettings: `{"network":"ws","security":"tls"}`, Settings: `{"clients":[]}`,
+	}
+	if err := db.Create(wsTls).Error; err != nil {
+		t.Fatalf("create ws: %v", err)
+	}
+
+	if err := svc.SyncInbound(nil, reality1.Id, []model.Client{clientWithInboundFlow(source, reality1)}); err != nil {
+		t.Fatalf("SyncInbound(reality1): %v", err)
+	}
+
+	rec, err := svc.GetRecordByEmail(nil, email)
+	if err != nil {
+		t.Fatalf("GetRecordByEmail: %v", err)
+	}
+	if err := db.Model(&model.ClientRecord{}).Where("id = ?", rec.Id).Update("flow", "").Error; err != nil {
+		t.Fatalf("zero canonical flow: %v", err)
+	}
+
+	inboundSvc := &InboundService{}
+	if _, _, err := svc.BulkAttach(inboundSvc, []string{email}, []int{reality2.Id, wsTls.Id}); err != nil {
+		t.Fatalf("BulkAttach: %v", err)
+	}
+
+	reality2List, err := svc.ListForInbound(nil, reality2.Id)
+	if err != nil {
+		t.Fatalf("ListForInbound(reality2): %v", err)
+	}
+	if len(reality2List) != 1 || reality2List[0].Flow != vision {
+		t.Errorf("bulk-attached flow-capable inbound must inherit Vision via EffectiveFlow (#6432), got %#v", reality2List)
+	}
+
+	wsList, err := svc.ListForInbound(nil, wsTls.Id)
+	if err != nil {
+		t.Fatalf("ListForInbound(ws): %v", err)
+	}
+	if len(wsList) != 1 || wsList[0].Flow != "" {
+		t.Errorf("bulk-attached non-flow inbound must not receive Vision flow, got %#v", wsList)
+	}
+}
+
+// A client detached from its last inbound has no effective flow left to settle
+// its record to, so the record keeps the flow a later attach falls back on.
+func TestRecordFlow_DetachedFromLastInboundKeepsFlow(t *testing.T) {
+	dbDir := t.TempDir()
+	t.Setenv("XUI_DB_FOLDER", dbDir)
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
+
+	reality := &model.Inbound{Tag: "vless-reality", Enable: true, Port: 43001, Protocol: model.VLESS, StreamSettings: `{"network":"tcp","security":"reality"}`}
+	if err := database.GetDB().Create(reality).Error; err != nil {
+		t.Fatalf("create reality inbound: %v", err)
+	}
+
+	svc := ClientService{}
+	const email = "detached@example.com"
+	const vision = "xtls-rprx-vision"
+	client := model.Client{Email: email, ID: "ce8d33df-3a64-4f10-8f9b-91c3a8e0c333", Enable: true, Flow: vision}
+	if err := svc.SyncInbound(nil, reality.Id, []model.Client{client}); err != nil {
+		t.Fatalf("SyncInbound(attach): %v", err)
+	}
+	if err := svc.SyncInbound(nil, reality.Id, nil); err != nil {
+		t.Fatalf("SyncInbound(detach): %v", err)
+	}
+
+	rec, err := svc.GetRecordByEmail(nil, email)
+	if err != nil {
+		t.Fatalf("GetRecordByEmail: %v", err)
+	}
+	if rec.Flow != vision {
+		t.Errorf("record flow after detaching its last inbound = %q, want %q", rec.Flow, vision)
 	}
 }

@@ -10,13 +10,14 @@ import { InfinityIcon } from '@/components/ui';
 import { useDatepicker } from '@/hooks/useDatepicker';
 import {
   genAllLinks,
-  genAmneziaWGConfigs,
-  genAmneziaWGLinks,
-  genWireguardConfigs,
-  genWireguardLinks,
+  genAmneziaWGPeerConfigs,
+  genAmneziaWGPeerLinks,
+  genWireguardPeerConfigs,
+  genWireguardPeerLinks,
   preferPublicHost,
 } from '@/lib/xray/inbound-link';
 import { inboundFromDb } from '@/lib/xray/inbound-from-db';
+import { withHostEndpoints } from '@/lib/hosts/host-link';
 
 import {
   buildInboundInfo,
@@ -24,10 +25,13 @@ import {
   downloadText,
   formatIpInfo,
   hasShareLink,
+  peerConfFileName,
   statsColor,
 } from './helpers';
 import type { ClientSetting, ClientStats, InboundInfo, InboundInfoModalProps } from './types';
 import './InboundInfoModal.css';
+
+const EMPTY_HOSTS: NonNullable<InboundInfoModalProps['hosts']> = [];
 
 export default function InboundInfoModal({
   open,
@@ -40,6 +44,7 @@ export default function InboundInfoModal({
   tgBotEnable = false,
   nodeAddress = '',
   subSettings,
+  hosts = EMPTY_HOSTS,
   lastOnlineMap = {},
 }: InboundInfoModalProps) {
   const { t } = useTranslation();
@@ -49,10 +54,10 @@ export default function InboundInfoModal({
   const [clientSettings, setClientSettings] = useState<ClientSetting | null>(null);
   const [clientStats, setClientStats] = useState<ClientStats | null>(null);
   const [links, setLinks] = useState<{ remark?: string; link: string }[]>([]);
-  const [wireguardConfigs, setWireguardConfigs] = useState<string[]>([]);
-  const [wireguardLinks, setWireguardLinks] = useState<string[]>([]);
-  const [amneziawgConfigs, setAmneziawgConfigs] = useState<string[]>([]);
-  const [amneziawgLinks, setAmneziawgLinks] = useState<string[]>([]);
+  const [wireguardConfigs, setWireguardConfigs] = useState<string[][]>([]);
+  const [wireguardLinks, setWireguardLinks] = useState<string[][]>([]);
+  const [amneziawgConfigs, setAmneziawgConfigs] = useState<string[][]>([]);
+  const [amneziawgLinks, setAmneziawgLinks] = useState<string[][]>([]);
   const [subLink, setSubLink] = useState('');
   const [subJsonLink, setSubJsonLink] = useState('');
   const [refreshing, setRefreshing] = useState(false);
@@ -64,7 +69,9 @@ export default function InboundInfoModal({
     if (!clientStats?.email) return;
     setRefreshing(true);
     try {
-      const msg = await HttpUtil.post(`/panel/api/clients/ips/${clientStats.email}`);
+      const msg = await HttpUtil.post(
+        `/panel/api/clients/ips/${encodeURIComponent(clientStats.email)}`,
+      );
       if (!msg?.success) {
         setClientIpsText((msg?.obj as string) || 'No IP record');
         setClientIpsArray([]);
@@ -96,7 +103,9 @@ export default function InboundInfoModal({
 
   const clearClientIps = useCallback(async () => {
     if (!clientStats?.email) return;
-    const msg = await HttpUtil.post(`/panel/api/clients/clearIps/${clientStats.email}`);
+    const msg = await HttpUtil.post(
+      `/panel/api/clients/clearIps/${encodeURIComponent(clientStats.email)}`,
+    );
     if (msg?.success) {
       setClientIpsArray([]);
       setClientIpsText(t('tgbot.noIpRecord'));
@@ -110,6 +119,7 @@ export default function InboundInfoModal({
     clientIndex: typeof clientIndex;
     nodeAddress: typeof nodeAddress;
     subSettings: typeof subSettings;
+    hosts: typeof hosts;
     ipLimitEnable: typeof ipLimitEnable;
   } | null>(null);
   if (
@@ -120,9 +130,10 @@ export default function InboundInfoModal({
       syncedProps.clientIndex !== clientIndex ||
       syncedProps.nodeAddress !== nodeAddress ||
       syncedProps.subSettings !== subSettings ||
+      syncedProps.hosts !== hosts ||
       syncedProps.ipLimitEnable !== ipLimitEnable)
   ) {
-    setSyncedProps({ dbInbound, clientIndex, nodeAddress, subSettings, ipLimitEnable });
+    setSyncedProps({ dbInbound, clientIndex, nodeAddress, subSettings, hosts, ipLimitEnable });
     const info = buildInboundInfo(dbInbound);
     setInbound(info);
     setActiveTab(info.clients.length > 0 ? 'client' : 'inbound');
@@ -135,47 +146,53 @@ export default function InboundInfoModal({
       : null;
     setClientStats(stats);
 
-    const inboundForLinks = inboundFromDb(dbInbound);
     const fallbackHostname = preferPublicHost(
       window.location.hostname,
       subSettings?.publicHost ?? '',
     );
+    const inboundForLinks = withHostEndpoints(
+      inboundFromDb(dbInbound),
+      dbInbound.id,
+      hosts,
+      nodeAddress,
+      fallbackHostname,
+    );
     if (info.protocol === Protocols.WIREGUARD) {
       setWireguardConfigs(
-        genWireguardConfigs({
+        genWireguardPeerConfigs({
           inbound: inboundForLinks,
           remark: dbInbound.remark,
           hostOverride: nodeAddress,
           fallbackHostname,
-        }).split('\r\n'),
+        }),
       );
       setWireguardLinks(
-        genWireguardLinks({
+        genWireguardPeerLinks({
           inbound: inboundForLinks,
           remark: dbInbound.remark,
           hostOverride: nodeAddress,
           fallbackHostname,
-        }).split('\r\n'),
+        }),
       );
       setAmneziawgConfigs([]);
       setAmneziawgLinks([]);
       setLinks([]);
     } else if (info.protocol === Protocols.AMNEZIAWG) {
       setAmneziawgConfigs(
-        genAmneziaWGConfigs({
+        genAmneziaWGPeerConfigs({
           inbound: inboundForLinks,
           remark: dbInbound.remark,
           hostOverride: nodeAddress,
           fallbackHostname,
-        }).split('\r\n'),
+        }),
       );
       setAmneziawgLinks(
-        genAmneziaWGLinks({
+        genAmneziaWGPeerLinks({
           inbound: inboundForLinks,
           remark: dbInbound.remark,
           hostOverride: nodeAddress,
           fallbackHostname,
-        }).split('\r\n'),
+        }),
       );
       setWireguardConfigs([]);
       setWireguardLinks([]);
@@ -210,7 +227,8 @@ export default function InboundInfoModal({
     setClientIpsText('');
 
     if (ipLimitEnable && (clientSet?.limitIp ?? 0) > 0 && stats?.email) {
-      void HttpUtil.post(`/panel/api/clients/ips/${stats.email}`).then((msg) => {
+      const email = encodeURIComponent(stats.email);
+      void HttpUtil.post(`/panel/api/clients/ips/${email}`).then((msg) => {
         if (!msg?.success) {
           setClientIpsText((msg?.obj as string) || 'No IP record');
           return;
@@ -520,7 +538,7 @@ export default function InboundInfoModal({
             <Tooltip title={t('copy')}>
               <Button
                 size="small"
-                icon={<CopyOutlined />}
+                icon={<CopyOutlined aria-hidden />}
                 aria-label={t('copy')}
                 onClick={() => copyText(clientSettings.tgId, t)}
               />
@@ -539,7 +557,7 @@ export default function InboundInfoModal({
                 <Tooltip title={t('copy')}>
                   <Button
                     size="small"
-                    icon={<CopyOutlined />}
+                    icon={<CopyOutlined aria-hidden />}
                     aria-label={t('copy')}
                     onClick={() => copyText(link.link, t)}
                   />
@@ -560,7 +578,7 @@ export default function InboundInfoModal({
               <Tooltip title={t('copy')}>
                 <Button
                   size="small"
-                  icon={<CopyOutlined />}
+                  icon={<CopyOutlined aria-hidden />}
                   aria-label={t('copy')}
                   onClick={() => copyText(subLink, t)}
                 />
@@ -582,7 +600,7 @@ export default function InboundInfoModal({
                 <Tooltip title={t('copy')}>
                   <Button
                     size="small"
-                    icon={<CopyOutlined />}
+                    icon={<CopyOutlined aria-hidden />}
                     aria-label={t('copy')}
                     onClick={() => copyText(subJsonLink, t)}
                   />
@@ -701,7 +719,7 @@ export default function InboundInfoModal({
                     <Button
                       size="small"
                       className="value-copy"
-                      icon={<CopyOutlined />}
+                      icon={<CopyOutlined aria-hidden />}
                       aria-label={t('copy')}
                       onClick={() => copyText(encryptionLabel, t)}
                     />
@@ -971,7 +989,7 @@ export default function InboundInfoModal({
                         <Button
                           size="small"
                           type="text"
-                          icon={<CopyOutlined />}
+                          icon={<CopyOutlined aria-hidden />}
                           aria-label={t('copy')}
                           onClick={() => copyText(`${account.user}:${account.pass}`, t)}
                         />
@@ -1087,7 +1105,7 @@ export default function InboundInfoModal({
                     <Tooltip title={t('copy')}>
                       <Button
                         size="small"
-                        icon={<CopyOutlined />}
+                        icon={<CopyOutlined aria-hidden />}
                         aria-label={t('copy')}
                         onClick={() => copyText(`${account.user}:${account.pass}`, t)}
                       />
@@ -1177,49 +1195,55 @@ export default function InboundInfoModal({
                     </dd>
                   </div>
                 </dl>
-                {wireguardConfigs[idx] && (
-                  <div className="link-panel">
-                    <div className="link-panel-header">
-                      <Tag color="green">
-                        {t('pages.inbounds.info.peerNumberConfig', { n: idx + 1 })}
-                      </Tag>
-                      <Tooltip title={t('copy')}>
-                        <Button
-                          size="small"
-                          icon={<CopyOutlined />}
-                          aria-label={t('copy')}
-                          onClick={() => copyText(wireguardConfigs[idx], t)}
-                        />
-                      </Tooltip>
-                      <Tooltip title={t('download')}>
-                        <Button
-                          size="small"
-                          icon={<DownloadOutlined />}
-                          aria-label={t('download')}
-                          onClick={() =>
-                            downloadText(wireguardConfigs[idx], `peer-${idx + 1}.conf`)
-                          }
-                        />
-                      </Tooltip>
-                    </div>
-                    <code className="link-panel-text">{wireguardConfigs[idx]}</code>
-                  </div>
+                {(wireguardConfigs[idx] ?? []).map(
+                  (cfg, j, all) =>
+                    cfg && (
+                      <div key={`wg-cfg-${j}`} className="link-panel">
+                        <div className="link-panel-header">
+                          <Tag color="green">
+                            {t('pages.inbounds.info.peerNumberConfig', { n: idx + 1 })}
+                          </Tag>
+                          <Tooltip title={t('copy')}>
+                            <Button
+                              size="small"
+                              icon={<CopyOutlined aria-hidden />}
+                              aria-label={t('copy')}
+                              onClick={() => copyText(cfg, t)}
+                            />
+                          </Tooltip>
+                          <Tooltip title={t('download')}>
+                            <Button
+                              size="small"
+                              icon={<DownloadOutlined aria-hidden />}
+                              aria-label={t('download')}
+                              onClick={() =>
+                                downloadText(cfg, peerConfFileName(idx, j, all.length))
+                              }
+                            />
+                          </Tooltip>
+                        </div>
+                        <code className="link-panel-text">{cfg}</code>
+                      </div>
+                    ),
                 )}
-                {wireguardLinks[idx] && (
-                  <div className="link-panel">
-                    <div className="link-panel-header">
-                      <Tag color="green">Peer {idx + 1} link</Tag>
-                      <Tooltip title={t('copy')}>
-                        <Button
-                          size="small"
-                          icon={<CopyOutlined />}
-                          aria-label={t('copy')}
-                          onClick={() => copyText(wireguardLinks[idx], t)}
-                        />
-                      </Tooltip>
-                    </div>
-                    <code className="link-panel-text">{wireguardLinks[idx]}</code>
-                  </div>
+                {(wireguardLinks[idx] ?? []).map(
+                  (link, j) =>
+                    link && (
+                      <div key={`wg-link-${j}`} className="link-panel">
+                        <div className="link-panel-header">
+                          <Tag color="green">Peer {idx + 1} link</Tag>
+                          <Tooltip title={t('copy')}>
+                            <Button
+                              size="small"
+                              icon={<CopyOutlined aria-hidden />}
+                              aria-label={t('copy')}
+                              onClick={() => copyText(link, t)}
+                            />
+                          </Tooltip>
+                        </div>
+                        <code className="link-panel-text">{link}</code>
+                      </div>
+                    ),
                 )}
               </Fragment>
             ))}
@@ -1229,73 +1253,57 @@ export default function InboundInfoModal({
       {inbound?.protocol === Protocols.AMNEZIAWG && amneziawgConfigs.length > 0 && (
         <>
           <Divider>{t('pages.inbounds.copyLink')}</Divider>
-          {amneziawgConfigs.map((cfg, idx) => (
+          {amneziawgConfigs.map((peerConfigs, idx) => (
             <Fragment key={idx}>
-              {cfg && (
-                <div className="link-panel">
-                  <div className="link-panel-header">
-                    <Tag color="green">
-                      {t('pages.inbounds.info.peerNumberConfig', { n: idx + 1 })}
-                    </Tag>
-                    <Tooltip title={t('copy')}>
-                      <Button
-                        size="small"
-                        icon={<CopyOutlined />}
-                        aria-label={t('copy')}
-                        onClick={() => copyText(cfg, t)}
-                      />
-                    </Tooltip>
-                    <Tooltip title={t('download')}>
-                      <Button
-                        size="small"
-                        icon={<DownloadOutlined />}
-                        aria-label={t('download')}
-                        onClick={() => downloadText(cfg, `peer-${idx + 1}.conf`)}
-                      />
-                    </Tooltip>
-                  </div>
-                  <code className="link-panel-text">{cfg}</code>
-                </div>
+              {peerConfigs.map(
+                (cfg, j, all) =>
+                  cfg && (
+                    <div key={`awg-cfg-${j}`} className="link-panel">
+                      <div className="link-panel-header">
+                        <Tag color="green">
+                          {t('pages.inbounds.info.peerNumberConfig', { n: idx + 1 })}
+                        </Tag>
+                        <Tooltip title={t('copy')}>
+                          <Button
+                            size="small"
+                            icon={<CopyOutlined aria-hidden />}
+                            aria-label={t('copy')}
+                            onClick={() => copyText(cfg, t)}
+                          />
+                        </Tooltip>
+                        <Tooltip title={t('download')}>
+                          <Button
+                            size="small"
+                            icon={<DownloadOutlined aria-hidden />}
+                            aria-label={t('download')}
+                            onClick={() => downloadText(cfg, peerConfFileName(idx, j, all.length))}
+                          />
+                        </Tooltip>
+                      </div>
+                      <code className="link-panel-text">{cfg}</code>
+                    </div>
+                  ),
               )}
-              {amneziawgLinks[idx] && (
-                <div className="link-panel">
-                  <div className="link-panel-header">
-                    <Tag color="green">Peer {idx + 1} link</Tag>
-                    <Tooltip title={t('copy')}>
-                      <Button
-                        size="small"
-                        icon={<CopyOutlined />}
-                        aria-label={t('copy')}
-                        onClick={() => copyText(amneziawgLinks[idx], t)}
-                      />
-                    </Tooltip>
-                  </div>
-                  <code className="link-panel-text">{amneziawgLinks[idx]}</code>
-                </div>
+              {(amneziawgLinks[idx] ?? []).map(
+                (link, j) =>
+                  link && (
+                    <div key={`awg-link-${j}`} className="link-panel">
+                      <div className="link-panel-header">
+                        <Tag color="green">Peer {idx + 1} link</Tag>
+                        <Tooltip title={t('copy')}>
+                          <Button
+                            size="small"
+                            icon={<CopyOutlined aria-hidden />}
+                            aria-label={t('copy')}
+                            onClick={() => copyText(link, t)}
+                          />
+                        </Tooltip>
+                      </div>
+                      <code className="link-panel-text">{link}</code>
+                    </div>
+                  ),
               )}
             </Fragment>
-          ))}
-        </>
-      )}
-
-      {dbInbound.isSS && !inbound.isSSMultiUser && links.length > 0 && (
-        <>
-          <Divider>{t('pages.inbounds.copyLink')}</Divider>
-          {links.map((link, idx) => (
-            <div key={idx} className="link-panel">
-              <div className="link-panel-header">
-                <Tag color="green">{link.remark || `Link ${idx + 1}`}</Tag>
-                <Tooltip title={t('copy')}>
-                  <Button
-                    size="small"
-                    icon={<CopyOutlined />}
-                    aria-label={t('copy')}
-                    onClick={() => copyText(link.link, t)}
-                  />
-                </Tooltip>
-              </div>
-              <code className="link-panel-text">{link.link}</code>
-            </div>
           ))}
         </>
       )}

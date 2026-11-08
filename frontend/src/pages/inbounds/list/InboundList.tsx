@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState, type Key } from 'react';
+import { useLocation, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
   Button,
@@ -31,9 +32,20 @@ import { activateOnKey } from '@/utils/a11y';
 
 import { buildRowActionsMenu } from './RowActions';
 import { useInboundColumns } from './useInboundColumns';
+import { buildHostRemarksByInboundId, formatHostRemarksLabel } from './helpers';
 import InboundStatsModal from './InboundStatsModal';
 import type { DBInboundRecord, GeneralAction, InboundListProps, RowAction } from './types';
 import './InboundList.css';
+
+function HostRemarksSuffix({ remarks }: { remarks: string[] }) {
+  if (remarks.length === 0) return null;
+  const { display, full } = formatHostRemarksLabel(remarks);
+  return (
+    <Tooltip title={full}>
+      <span className="inbound-host-remarks"> ({display})</span>
+    </Tooltip>
+  );
+}
 
 export default function InboundList({
   dbInbounds,
@@ -47,6 +59,7 @@ export default function InboundList({
   subEnable,
   nodesById,
   hasActiveNode,
+  hosts,
   onAddInbound,
   onGeneralAction,
   onRowAction,
@@ -58,7 +71,18 @@ export default function InboundList({
   // Node filter (#4997): 'all' shows everything, 0 is the local-panel
   // sentinel (inbounds without a nodeId), otherwise a node id. Session-only.
   const [nodeFilter, setNodeFilter] = useState<number | 'all'>('all');
-  const [searchKey, setSearchKey] = useState('');
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const searchParam = searchParams.get('search');
+  const [searchKey, setSearchKey] = useState(() => searchParam || '');
+  const [prevLocationKey, setPrevLocationKey] = useState(location.key);
+
+  if (location.key !== prevLocationKey) {
+    setPrevLocationKey(location.key);
+    if (searchParam !== null) {
+      setSearchKey(searchParam);
+    }
+  }
 
   const showNodeFilter = useMemo(
     () => nodesById.size > 0 || dbInbounds.some((ib) => ib.nodeId != null),
@@ -74,19 +98,22 @@ export default function InboundList({
     [nodesById, t],
   );
 
+  const hostRemarksByInboundId = useMemo(() => buildHostRemarksByInboundId(hosts), [hosts]);
+
   const visibleInbounds = useMemo(() => {
     let list = dbInbounds;
     if (nodeFilter === 0) list = list.filter((ib) => ib.nodeId == null);
     else if (nodeFilter !== 'all') list = list.filter((ib) => ib.nodeId === nodeFilter);
     const q = searchKey.trim().toLowerCase();
     if (!q) return list;
-    return list.filter(
-      (ib) =>
-        (ib.remark || '').toLowerCase().includes(q) ||
-        String(ib.port).includes(q) ||
-        (ib.protocol || '').toLowerCase().includes(q),
-    );
-  }, [dbInbounds, nodeFilter, searchKey]);
+    return list.filter((ib) => {
+      if ((ib.remark || '').toLowerCase().includes(q)) return true;
+      if (String(ib.port).includes(q)) return true;
+      if ((ib.protocol || '').toLowerCase().includes(q)) return true;
+      const hostRemarks = hostRemarksByInboundId.get(ib.id) ?? [];
+      return hostRemarks.some((remark) => remark.toLowerCase().includes(q));
+    });
+  }, [dbInbounds, nodeFilter, searchKey, hostRemarksByInboundId]);
 
   const onSwitchEnable = useCallback(async (dbInbound: DBInboundRecord, next: boolean) => {
     const previous = dbInbound.enable;
@@ -102,12 +129,14 @@ export default function InboundList({
   }, []);
 
   const hasAnyRemark = useMemo(
-    () => dbInbounds.some((i) => typeof i.remark === 'string' && i.remark.trim() !== ''),
-    [dbInbounds],
+    () =>
+      dbInbounds.some((i) => typeof i.remark === 'string' && i.remark.trim() !== '') ||
+      dbInbounds.some((i) => (hostRemarksByInboundId.get(i.id)?.length ?? 0) > 0),
+    [dbInbounds, hostRemarksByInboundId],
   );
 
   const hasAnySubSortIndex = useMemo(
-    () => dbInbounds.some((i) => (i.subSortIndex ?? 1) > 1),
+    () => dbInbounds.some((i) => (i.subSortIndex ?? 1) !== 1),
     [dbInbounds],
   );
 
@@ -142,6 +171,7 @@ export default function InboundList({
     hasAnySubSortIndex,
     hasActiveNode,
     nodesById,
+    hostRemarksByInboundId,
     clientCount,
     inboundSpeed,
     subEnable,
@@ -163,20 +193,24 @@ export default function InboundList({
 
   const generalActionsMenu: MenuProps = {
     items: [
-      { key: 'import', icon: <ImportOutlined />, label: t('pages.inbounds.importInbound') },
-      { key: 'export', icon: <ExportOutlined />, label: t('pages.inbounds.export') },
+      {
+        key: 'import',
+        icon: <ImportOutlined aria-hidden />,
+        label: t('pages.inbounds.importInbound'),
+      },
+      { key: 'export', icon: <ExportOutlined aria-hidden />, label: t('pages.inbounds.export') },
       ...(subEnable
         ? [
             {
               key: 'subs',
-              icon: <ExportOutlined />,
+              icon: <ExportOutlined aria-hidden />,
               label: `${t('pages.inbounds.export')} — ${t('pages.settings.subSettings')}`,
             },
           ]
         : []),
       {
         key: 'resetInbounds',
-        icon: <ReloadOutlined />,
+        icon: <ReloadOutlined aria-hidden />,
         label: t('pages.inbounds.resetAllTraffic'),
       },
     ],
@@ -191,7 +225,7 @@ export default function InboundList({
           <Button
             type="primary"
             onClick={onAddInbound}
-            icon={<PlusOutlined />}
+            icon={<PlusOutlined aria-hidden />}
             aria-label={t('pages.inbounds.addInbound')}
           >
             {!isMobile && t('pages.inbounds.addInbound')}
@@ -199,7 +233,7 @@ export default function InboundList({
           <Dropdown trigger={['click']} menu={generalActionsMenu}>
             <Button
               type="primary"
-              icon={<MenuOutlined />}
+              icon={<MenuOutlined aria-hidden />}
               aria-label={t('pages.inbounds.generalActions')}
             >
               {!isMobile && t('pages.inbounds.generalActions')}
@@ -221,7 +255,7 @@ export default function InboundList({
             onChange={(e) => setSearchKey(e.target.value)}
             placeholder={t('search')}
             allowClear
-            prefix={<SearchOutlined />}
+            prefix={<SearchOutlined aria-hidden />}
             style={{ maxWidth: isMobile ? 110 : 200 }}
             aria-label={t('search')}
           />
@@ -237,7 +271,7 @@ export default function InboundList({
               </Tag>
               <Button
                 danger
-                icon={<DeleteOutlined />}
+                icon={<DeleteOutlined aria-hidden />}
                 onClick={handleBulkDelete}
                 aria-label={t('delete')}
               >
@@ -253,7 +287,7 @@ export default function InboundList({
           <div className="inbound-cards">
             {visibleInbounds.length === 0 ? (
               <div className="card-empty">
-                <ImportOutlined style={{ fontSize: 28, opacity: 0.5 }} />
+                <ImportOutlined aria-hidden style={{ fontSize: 28, opacity: 0.5 }} />
                 <div>{t('noData')}</div>
               </div>
             ) : (
@@ -281,7 +315,10 @@ export default function InboundList({
                         onChange={(e) => toggleSelect(record.id, e.target.checked)}
                       />
                       <span className="card-id">#{record.id}</span>
-                      <span className="tag-name">{record.remark}</span>
+                      <span className="tag-name">
+                        <span className="inbound-remark">{record.remark}</span>
+                        <HostRemarksSuffix remarks={hostRemarksByInboundId.get(record.id) ?? []} />
+                      </span>
                       <div className="card-actions">
                         <Tooltip title={t('pages.inbounds.inboundInfo')}>
                           <InfoCircleOutlined
@@ -294,6 +331,7 @@ export default function InboundList({
                           />
                         </Tooltip>
                         <Switch
+                          aria-label={t('pages.inbounds.enable')}
                           checked={record.enable}
                           size="small"
                           onChange={(next) => onSwitchEnable(record, next)}
@@ -317,7 +355,7 @@ export default function InboundList({
                             type="text"
                             size="small"
                             className="row-action-trigger"
-                            icon={<MoreOutlined />}
+                            icon={<MoreOutlined aria-hidden />}
                             aria-label={t('more')}
                           />
                         </Dropdown>
@@ -344,7 +382,7 @@ export default function InboundList({
             locale={{
               emptyText: (
                 <div className="card-empty">
-                  <ImportOutlined style={{ fontSize: 32, marginBottom: 8 }} />
+                  <ImportOutlined aria-hidden style={{ fontSize: 32, marginBottom: 8 }} />
                   <div>{t('noData')}</div>
                 </div>
               ),

@@ -290,7 +290,13 @@ export default function NodesPage() {
 
         <Layout className="content-shell">
           <Layout.Content id="content-layout" className="content-area">
-            <Spin spinning={!fetched} delay={200} description={t('loading')} size="large">
+            <Spin
+              aria-live="off"
+              spinning={!fetched}
+              delay={200}
+              description={t('loading')}
+              size="large"
+            >
               {!fetched ? (
                 <div className="loading-spacer" />
               ) : fetchError ? (
@@ -313,7 +319,7 @@ export default function NodesPage() {
                           <Statistic
                             title={t('pages.nodes.totalNodes')}
                             value={String(totals.total)}
-                            prefix={<CloudServerOutlined />}
+                            prefix={<CloudServerOutlined aria-hidden />}
                           />
                         </Col>
                         <Col xs={12} sm={12} md={6}>
@@ -321,7 +327,10 @@ export default function NodesPage() {
                             title={t('pages.nodes.onlineNodes')}
                             value={String(totals.online)}
                             prefix={
-                              <CheckCircleOutlined style={{ color: 'var(--ant-color-success)' }} />
+                              <CheckCircleOutlined
+                                aria-hidden
+                                style={{ color: 'var(--ant-color-success)' }}
+                              />
                             }
                           />
                         </Col>
@@ -330,7 +339,10 @@ export default function NodesPage() {
                             title={t('pages.nodes.offlineNodes')}
                             value={String(totals.offline)}
                             prefix={
-                              <CloseCircleOutlined style={{ color: 'var(--ant-color-error)' }} />
+                              <CloseCircleOutlined
+                                aria-hidden
+                                style={{ color: 'var(--ant-color-error)' }}
+                              />
                             }
                           />
                         </Col>
@@ -338,7 +350,7 @@ export default function NodesPage() {
                           <Statistic
                             title={t('pages.nodes.avgLatency')}
                             value={totals.avgLatency > 0 ? `${totals.avgLatency} ms` : '-'}
-                            prefix={<ThunderboltOutlined />}
+                            prefix={<ThunderboltOutlined aria-hidden />}
                           />
                         </Col>
                       </Row>
@@ -398,6 +410,7 @@ export default function NodesPage() {
           </Typography.Paragraph>
           <Typography.Text strong>{t('pages.nodes.mtls.trustLabel')}</Typography.Text>
           <Input.TextArea
+            aria-label={t('pages.nodes.mtls.trustLabel')}
             rows={5}
             value={trustCa}
             onChange={(e) => setTrustCa(e.target.value)}

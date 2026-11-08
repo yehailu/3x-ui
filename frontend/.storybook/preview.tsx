@@ -5,6 +5,7 @@ import i18next from 'i18next';
 import { initReactI18next } from 'react-i18next';
 
 import { buildAntdThemeConfig } from '@/hooks/useTheme';
+import { INTERPOLATION } from '@/i18n/react';
 import enUS from '../../internal/web/translation/en-US.json';
 
 if (!i18next.isInitialized) {
@@ -12,7 +13,7 @@ if (!i18next.isInitialized) {
     lng: 'en-US',
     fallbackLng: 'en-US',
     resources: { 'en-US': { translation: enUS } },
-    interpolation: { escapeValue: false, prefix: '{', suffix: '}' },
+    interpolation: INTERPOLATION,
     returnNull: false,
   });
 }
@@ -22,10 +23,13 @@ export const withTheme: Decorator = (Story, context) => {
   useLayoutEffect(() => {
     document.body.classList.remove('dark', 'light');
     document.body.classList.add(dark ? 'dark' : 'light');
+    document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
     document.documentElement.removeAttribute('data-theme');
   }, [dark]);
   return (
-    <ConfigProvider theme={buildAntdThemeConfig(dark, false)}>
+    // The click wave outlives its story and re-renders from a ResizeObserver
+    // inside the next story's act(), tripping React's act-environment warning.
+    <ConfigProvider theme={buildAntdThemeConfig(dark, false)} wave={{ disabled: true }}>
       <div style={{ padding: 24, minWidth: 320 }}>
         <Story />
       </div>

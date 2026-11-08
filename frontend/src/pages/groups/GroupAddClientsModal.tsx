@@ -82,7 +82,7 @@ export default function GroupAddClientsModal({
           g ? (
             <Tag color="geekblue">{g}</Tag>
           ) : (
-            <span style={{ color: 'rgba(0,0,0,0.45)' }}>—</span>
+            <Typography.Text type="secondary">—</Typography.Text>
           ),
       },
       {
@@ -138,6 +138,7 @@ export default function GroupAddClientsModal({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={t('pages.inbounds.attachClientsSearchPlaceholder')}
+            aria-label={t('pages.inbounds.attachClientsSearchPlaceholder')}
             style={{ maxWidth: 320 }}
           />
           <Typography.Text type="secondary">

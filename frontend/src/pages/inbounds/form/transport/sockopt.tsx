@@ -1,7 +1,10 @@
+import { NativeSelect } from '@/components/form/NativeSelect';
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Alert, Form, InputNumber, Segmented, Select, Switch } from 'antd';
 import { Controller, useFormContext, useWatch } from 'react-hook-form';
 
+import { selectTagRender } from '@/components/form';
 import { FormField } from '@/components/form/rhf';
 import { SockoptCustomField } from '@/lib/xray/forms/fields';
 import { TCP_CONGESTION_OPTION } from '@/schemas/primitives';
@@ -28,6 +31,7 @@ export default function SockoptForm({
   network: string;
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   const { control, getValues, setValue } = useFormContext();
   const sock = useWatch({ control, name: 'streamSettings.sockopt' });
   const on = !!sock && typeof sock === 'object' && Object.keys(sock).length > 0;
@@ -101,6 +105,8 @@ export default function SockoptForm({
             tooltip={t('pages.inbounds.form.realClientIpHint')}
           >
             <Segmented
+              aria-label={t('pages.inbounds.form.realClientIp')}
+              aria-describedby={`${uid}-real-client-ip-hint`}
               value={presetValue}
               onChange={(v) => applyRealClientIpPreset(v as RealClientIpPreset)}
               options={[
@@ -112,6 +118,9 @@ export default function SockoptForm({
                 { value: 'proxy', label: t('pages.inbounds.form.realClientIpPresetProxyProtocol') },
               ]}
             />
+            <span id={`${uid}-real-client-ip-hint`} hidden>
+              {t('pages.inbounds.form.realClientIpHint')}
+            </span>
           </Form.Item>
           {trustedMismatch && (
             <Alert
@@ -199,13 +208,13 @@ export default function SockoptForm({
             name={['streamSettings', 'sockopt', 'tcpcongestion']}
             label={t('pages.inbounds.form.tcpCongestion')}
           >
-            <Select
+            <NativeSelect
               style={{ width: '50%' }}
               options={Object.values(TCP_CONGESTION_OPTION).map((c) => ({ value: c, label: c }))}
             />
           </FormField>
           <FormField name={['streamSettings', 'sockopt', 'tproxy']} label="TProxy">
-            <Select
+            <NativeSelect
               style={{ width: '50%' }}
               options={[
                 { value: 'off', label: 'Off' },
@@ -221,6 +230,7 @@ export default function SockoptForm({
           >
             <Select
               mode="tags"
+              tagRender={selectTagRender}
               style={{ width: '100%' }}
               tokenSeparators={[',']}
               options={[

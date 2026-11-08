@@ -1,4 +1,5 @@
 import { ObjectUtil } from '@/utils';
+import type { SubProfileMode, SubHostSortMode } from '@/schemas/setting';
 
 export class AllSetting {
   webListen = '';
@@ -9,6 +10,8 @@ export class AllSetting {
   webBasePath = '/';
   sessionMaxAge = 360;
   trustedProxyCIDRs = '127.0.0.1/32,::1/128';
+  realityScanCandidates =
+    'www.cloudflare.com:443,www.microsoft.com:443,www.amazon.com:443,aws.amazon.com:443,www.samsung.com:443,www.nvidia.com:443,www.amd.com:443,www.intel.com:443,www.sony.com:443,dl.google.com:443';
   ipLimitAllowlist = '';
   panelOutbound = '';
   pageSize = 25;
@@ -16,6 +19,12 @@ export class AllSetting {
   trafficDiff = 0;
   remarkTemplate = '{{INBOUND}}-{{EMAIL}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D';
   subShowIdentityOnAllLinks = false;
+  subInfoNodeEnable = false;
+  subHostSortMode: SubHostSortMode = 'inbound-first';
+  subCalendarExpireInclusive = false;
+  subExpiredTemplate = '⛔ {{EMAIL}} | Expired: {{EXPIRE_DATE}}';
+  subTrafficDepletedTemplate =
+    '🚫 {{EMAIL}} | Traffic Depleted | {{TRAFFIC_USED}}/{{TRAFFIC_TOTAL}}';
   datepicker: 'gregorian' | 'jalalian' = 'gregorian';
   tgBotEnable = false;
   tgBotToken = '';
@@ -29,6 +38,7 @@ export class AllSetting {
   twoFactorEnable = false;
   twoFactorToken = '';
   xrayTemplateConfig = '';
+  happLinkEnable = false;
   subEnable = true;
   subJsonEnable = false;
   subJsonAutoDetect = false;
@@ -38,6 +48,7 @@ export class AllSetting {
   subClashUserAgentRegex = '';
   subTitle = '';
   subSupportUrl = '';
+  subProfileMode: SubProfileMode = 'none';
   subProfileUrl = '';
   subAnnounce = '';
   subEnableRouting = false;
@@ -56,6 +67,7 @@ export class AllSetting {
   restartXrayOnClientDisable = true;
   subCertFile = '';
   subKeyFile = '';
+  externalSubUserAgent = 'v2rayNG/1.8.5';
   subUpdates = 12;
   subEncrypt = true;
   subURI = '';
@@ -63,12 +75,68 @@ export class AllSetting {
   subClashURI = '';
   subClashEnableRouting = false;
   subClashRules = '';
+  subClashRemoteDNS = false;
   subJsonMux = '';
   subJsonRules = '';
+  subJsonRoutingRules = '';
+  subJsonDns = '';
   subJsonFinalMask = '';
   subJsonObservatory = '';
   subThemeDir = '';
   subHideSettings = false;
+  subHappAutoDetect = false;
+  subHappProviderId = '';
+  subHappNewUrl = '';
+  subHappFallbackUrl = '';
+  subHappSubInfoColor = 'blue';
+  subHappSubInfoText = '';
+  subHappSubInfoButtonText = '';
+  subHappSubInfoButtonLink = '';
+  subHappSubExpire = false;
+  subHappSubExpireButtonLink = '';
+  subHappNotificationExpire = false;
+  subHappNoLimit = false;
+  subHappAlwaysHwid = false;
+  subHappTunMode = '';
+  subHappTunType = '';
+  subHappExcludeRoutes = '';
+  subHappExcludeApns = false;
+  subHappColorProfile = '';
+  subHappPingType = '';
+  subHappAutoConnect = false;
+  subHappAutoConnectType = 'lowestdelay';
+  subHappPerAppMode = 'off';
+  subHappPerAppList = '';
+  subHappLocalProxyAuth = 'auto';
+
+  subIncyAppAutoDetect = false;
+  subIncyProfileDescription = '';
+  subIncySortOrder = '';
+  subIncySupportEmail = '';
+  subIncyAnnounceUrl = '';
+  subIncyPremiumUrl = '';
+  subIncyBannerText = '';
+  subIncyBannerButtonText = '';
+  subIncyBannerButtonUrl = '';
+  subIncyBannerBgColor = '';
+  subIncyBannerButtonColor = '';
+  subIncyHideUrl = '';
+  subIncyHideCheck = '';
+  subIncyNoLimitEnabled = '';
+  subIncyPerAppEnable = '';
+  subIncyPerAppMode = '';
+  subIncyPerAppList = '';
+  subIncyFragmentationEnable = '';
+  subIncyFragmentLength = '';
+  subIncyFragmentInterval = '';
+  subIncyFragmentPackets = '';
+  subIncyNoisesEnable = '';
+  subIncyNoisesType = '';
+  subIncyNoisesPacket = '';
+  subIncyNoisesDelay = '';
+  subIncyResolveEnable = '';
+  subIncyResolveDnsDomain = '';
+  subIncyResolveDnsIp = '';
 
   timeLocation = 'Local';
 
@@ -107,6 +175,7 @@ export class AllSetting {
   smtpCpu = 80;
   smtpMemory = 80;
   outboundDownThreshold = 3;
+  nodeDownThreshold = 1;
   hasTgBotToken = false;
   hasTwoFactorToken = false;
   hasLdapPassword = false;
@@ -117,10 +186,31 @@ export class AllSetting {
   clearTgBotToken = false;
   clearLdapPassword = false;
   clearSmtpPassword = false;
+  discordBotEnable = false;
+  discordBotToken = '';
+  discordChannelId = '';
+  discordAdminIds = '';
+  discordRunTime = '@daily';
+  discordBotBackup = false;
+  discordCpu = 80;
+  discordMemory = 80;
+  discordLang = 'en-US';
+  discordEnabledEvents = 'login.attempt,cpu.high';
+  hasDiscordBotToken = false;
+  clearDiscordBotToken = false;
 
   constructor(data?: unknown) {
     if (data != null) {
       ObjectUtil.cloneProps(this, data);
+    }
+    // Legacy settings with a custom URL retain it until an explicit mode is saved.
+    if (
+      typeof data === 'object' &&
+      data !== null &&
+      (!('subProfileMode' in data) || data.subProfileMode === undefined) &&
+      this.subProfileUrl.trim() !== ''
+    ) {
+      this.subProfileMode = 'custom';
     }
     const cpu = Math.round(Number(this.tgCpu));
     this.tgCpu = Number.isFinite(cpu) ? Math.min(100, Math.max(0, cpu)) : 80;
@@ -128,6 +218,10 @@ export class AllSetting {
     this.outboundDownThreshold = Number.isFinite(threshold)
       ? Math.min(100, Math.max(1, threshold))
       : 3;
+    const nodeThreshold = Math.round(Number(this.nodeDownThreshold));
+    this.nodeDownThreshold = Number.isFinite(nodeThreshold)
+      ? Math.min(100, Math.max(1, nodeThreshold))
+      : 1;
   }
 
   equals(other: AllSetting): boolean {

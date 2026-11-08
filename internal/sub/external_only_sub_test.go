@@ -28,7 +28,7 @@ func TestJsonAndClashServeExternalLinkOnlySub(t *testing.T) {
 
 	base := NewSubService("")
 
-	jsonService := NewSubJsonService("", "", "", base)
+	jsonService := NewSubJsonService("", "", "", "", base)
 	jsonOut, _, err := jsonService.GetJson("ext-only", "sub.example.com", false)
 	if err != nil {
 		t.Fatalf("GetJson err = %v", err)
@@ -56,7 +56,7 @@ func TestJsonAndClashServeExternalLinkOnlySub(t *testing.T) {
 		t.Fatalf("standards-compliant GetJson profile count = %d, want 1", len(configs))
 	}
 
-	clashOut, _, err := NewSubClashService(false, "", base).GetClash("ext-only", "sub.example.com")
+	clashOut, _, err := NewSubClashService(false, "", false, base).GetClash("ext-only", "sub.example.com")
 	if err != nil {
 		t.Fatalf("GetClash err = %v", err)
 	}

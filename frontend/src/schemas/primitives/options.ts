@@ -39,14 +39,6 @@ export const MODE_OPTION = Object.freeze({
   STREAM_ONE: 'stream-one',
 });
 
-export const WireguardDomainStrategy = Object.freeze([
-  'ForceIP',
-  'ForceIPv4',
-  'ForceIPv4v6',
-  'ForceIPv6',
-  'ForceIPv6v4',
-] as const);
-
 export const Address_Port_Strategy = Object.freeze({
   NONE: 'none',
   SRV_PORT_ONLY: 'SrvPortOnly',
@@ -80,6 +72,37 @@ export const TLS_CIPHER_OPTION = Object.freeze({
   ECDHE_RSA_AES_256_GCM: 'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
   ECDHE_ECDSA_CHACHA20_POLY1305: 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
   ECDHE_RSA_CHACHA20_POLY1305: 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
+});
+
+// Whole ordered client lists (PattN's presets): the order is part of the ClientHello,
+// and clients apply them only under the uTLS fingerprint "unsafe".
+export const TLS_CIPHER_PRESETS = Object.freeze({
+  'semi-python': [
+    'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA',
+    'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA',
+    'TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256',
+    'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256',
+  ].join(':'),
+  'real-firefox': [
+    'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA',
+    'TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA',
+    'TLS_RSA_WITH_AES_128_GCM_SHA256',
+    'TLS_RSA_WITH_AES_256_GCM_SHA384',
+    'TLS_RSA_WITH_AES_128_CBC_SHA',
+    'TLS_RSA_WITH_AES_256_CBC_SHA',
+  ].join(':'),
 });
 
 export const USAGE_OPTION = Object.freeze({

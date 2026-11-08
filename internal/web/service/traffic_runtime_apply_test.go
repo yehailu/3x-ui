@@ -20,8 +20,8 @@ func TestTrafficDisableImmediatelyUpdatesNodeRuntime(t *testing.T) {
 		t.Fatalf("seed traffic: %v", err)
 	}
 
-	if _, _, _, err := (&InboundService{}).addTrafficLocked(nil, nil); err != nil {
-		t.Fatalf("addTrafficLocked: %v", err)
+	if _, _, err := (&InboundService{}).AddTraffic(nil, nil); err != nil {
+		t.Fatalf("AddTraffic: %v", err)
 	}
 	if got := fake.updateInbound.Load(); got != 1 {
 		t.Fatalf("remote UpdateInbound calls = %d, want 1 after commit", got)
@@ -52,8 +52,8 @@ func TestTrafficDisableRefreshesLocalMTProtoSidecar(t *testing.T) {
 		t.Fatalf("deplete traffic: %v", err)
 	}
 
-	if _, _, _, err := (&InboundService{}).addTrafficLocked(nil, nil); err != nil {
-		t.Fatalf("addTrafficLocked: %v", err)
+	if _, _, err := (&InboundService{}).AddTraffic(nil, nil); err != nil {
+		t.Fatalf("AddTraffic: %v", err)
 	}
 	if got := fake.updateInbound.Load(); got != 1 {
 		t.Fatalf("MTProto sidecar UpdateInbound calls = %d, want 1 after commit", got)
@@ -76,11 +76,21 @@ func TestDelDepletedClientsCleansRuntimeAfterCommit(t *testing.T) {
 		Updates(map[string]any{"up": 100, "total": 100, "reset": 0}).Error; err != nil {
 		t.Fatalf("deplete traffic: %v", err)
 	}
+	balancer := &model.SubBalancer{Remark: "depleted", InboundIds: []int{ib.Id}, Enabled: true}
+	if err := database.GetDB().Create(balancer).Error; err != nil {
+		t.Fatalf("create balancer: %v", err)
+	}
 
 	if err := (&InboundService{}).DelDepletedClients(-1); err != nil {
 		t.Fatalf("DelDepletedClients: %v", err)
 	}
 	if got := fake.delInbound.Load(); got != 1 {
 		t.Fatalf("runtime DelInbound calls = %d, want 1 after commit", got)
+	}
+	if err := database.GetDB().First(balancer, balancer.Id).Error; err != nil {
+		t.Fatalf("reload balancer: %v", err)
+	}
+	if len(balancer.InboundIds) != 0 {
+		t.Fatalf("balancer members after the inbound went = %v, want none", balancer.InboundIds)
 	}
 }

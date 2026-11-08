@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useId, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { Card, theme } from 'antd';
 
@@ -6,6 +6,7 @@ import { Sparkline } from '@/components/viz';
 import { mean, peak } from './useOverviewHistory';
 
 interface VitalTileProps {
+  available?: boolean;
   icon: ReactNode;
   label: string;
   percent: number;
@@ -18,6 +19,7 @@ interface VitalTileProps {
 }
 
 export default function VitalTile({
+  available = true,
   icon,
   label,
   percent,
@@ -29,6 +31,7 @@ export default function VitalTile({
   isMobile,
 }: VitalTileProps) {
   const { token } = theme.useToken();
+  const labelId = useId();
   const meanColor = token.colorTextTertiary;
 
   const referenceLines = useMemo(
@@ -37,22 +40,30 @@ export default function VitalTile({
   );
 
   return (
-    <Card hoverable className="ov-tile" styles={{ body: { padding: 0 } }}>
+    <Card
+      hoverable
+      className="ov-tile"
+      styles={{ body: { padding: 0 } }}
+      role="group"
+      aria-labelledby={labelId}
+    >
       <div className="ov-tile-head">
         <span className="ov-tile-icon">{icon}</span>
-        <span className="ov-kicker">{label}</span>
+        <span className="ov-kicker" id={labelId}>
+          {label}
+        </span>
       </div>
 
       <div className="ov-tile-value">
-        <span className="ov-tile-number">{percent.toFixed(1)}</span>
-        <span className="ov-tile-unit">%</span>
+        <span className="ov-tile-number">{available ? percent.toFixed(1) : '—'}</span>
+        {available && <span className="ov-tile-unit">%</span>}
       </div>
 
-      <div className="ov-tile-detail">{detail}</div>
+      <div className="ov-tile-detail">{available ? detail : '—'}</div>
 
       <div className="ov-tile-foot">
-        <span>{footLeft}</span>
-        <span>{footRight}</span>
+        <span>{available ? footLeft : '—'}</span>
+        <span>{available ? footRight : '—'}</span>
       </div>
 
       <div className="ov-tile-chart">

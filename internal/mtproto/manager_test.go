@@ -18,7 +18,7 @@ func TestInstanceFromInbound(t *testing.T) {
 		Settings: `{"fakeTlsDomain":"example.com",` +
 			`"debug":true,"proxyProtocolListener":true,"preferIp":"prefer-ipv4",` +
 			`"domainFronting":{"ip":"127.0.0.1","port":9443,"proxyProtocol":true},` +
-			`"throttleMaxConnections":5000,` +
+			`"throttleMaxConnections":5000,"pendingHandshakesMaxPerIp":64,` +
 			`"routeThroughXray":true,"routeXrayPort":50000,` +
 			`"adTag":" 0123456789abcdef0123456789abcdef ",` +
 			`"clients":[` +
@@ -60,6 +60,9 @@ func TestInstanceFromInbound(t *testing.T) {
 	if inst.ThrottleMaxConnections != 5000 {
 		t.Fatalf("throttle not parsed: %+v", inst)
 	}
+	if inst.PendingHandshakesMaxPerIP != 64 {
+		t.Fatalf("pending-handshake limit not parsed: %+v", inst)
+	}
 	if !inst.RouteThroughXray || inst.XrayRoutePort != 50000 {
 		t.Fatalf("xray routing not parsed: %+v", inst)
 	}
@@ -73,13 +76,49 @@ func TestInstanceFromInbound(t *testing.T) {
 		t.Fatal("an inbound with no active secret should not produce an instance")
 	}
 
-	badTags := &model.Inbound{Protocol: model.MTProto, Settings: `{"clients":[{"email":"x","secret":"ee00","adTag":"deadbeef","enable":true}]}`}
+	badTags := &model.Inbound{Protocol: model.MTProto, Settings: `{"clients":[{"email":"x","secret":"` + aliceSecret + `","adTag":"deadbeef","enable":true}]}`}
 	badInst, ok := InstanceFromInbound(badTags)
 	if !ok {
 		t.Fatal("expected a usable instance despite a malformed ad tag")
 	}
 	if badInst.Secrets[0].AdTag != "" {
 		t.Fatalf("a malformed ad tag must be dropped so the generated config stays valid, got %q", badInst.Secrets[0].AdTag)
+	}
+}
+
+// mtg refuses its whole config over one secret, quota or expiry it cannot
+// parse, which would take every client of the inbound down with the one holding it.
+func TestInstanceFromInboundLeavesOutWhatMtgCannotParse(t *testing.T) {
+	const good = "ee0123456789abcdef0123456789abcdef6578616d706c652e636f6d"
+	inst, ok := InstanceFromInbound(&model.Inbound{Id: 1, Protocol: model.MTProto, Port: 443, Settings: `{"clients":[` +
+		`{"email":"hex","enable":true,"secret":"` + good + `","totalGB":1000,"expiryTime":4102444800000},` +
+		`{"email":"base64","enable":true,"secret":"7gEjRWeJq83vASNFZ4mrze9leGFtcGxlLmNvbQ"},` +
+		`{"email":"truncated","enable":true,"secret":"zz"},` +
+		`{"email":"not-faketls","enable":true,"secret":"dd0123456789abcdef0123456789abcdef6578616d706c652e636f6d"},` +
+		`{"email":"no-host","enable":true,"secret":"ee0123456789abcdef0123456789abcdef"},` +
+		`{"email":"year-10000","enable":true,"secret":"` + good + `","expiryTime":253402300800000},` +
+		`{"email":"huge-quota","enable":true,"secret":"` + good + `","totalGB":9223372036854775806}]}`})
+	if !ok {
+		t.Fatal("expected a usable instance")
+	}
+	got := map[string]SecretEntry{}
+	for _, e := range inst.Secrets {
+		got[e.Name] = e
+	}
+	if len(got) != 4 {
+		t.Fatalf("only the clients mtg can parse should be served, got %+v", inst.Secrets)
+	}
+	if e := got["hex"]; e.Secret != good || e.QuotaBytes != 1000 || e.ExpiresUnix != 4102444800 {
+		t.Fatalf("parsable values must be kept as stored, got %+v", e)
+	}
+	if _, served := got["base64"]; !served {
+		t.Fatal("mtg parses a base64 secret, so its client must be served")
+	}
+	if e := got["year-10000"]; expiresString(e.ExpiresUnix) != "9999-12-31T23:59:59Z" {
+		t.Fatalf("an expiry past RFC 3339 must be capped, got %q", expiresString(e.ExpiresUnix))
+	}
+	if e := got["huge-quota"]; e.QuotaBytes != 9_000_000_000_000_000_000 {
+		t.Fatalf("a quota mtg's parser overflows on must be capped, got %d", e.QuotaBytes)
 	}
 }
 
@@ -90,7 +129,7 @@ func TestRenderConfig(t *testing.T) {
 		Secrets: []SecretEntry{{Name: "alice", Secret: "ee00"}},
 		Listen:  "0.0.0.0", Port: 8443,
 	}, 5000, "")
-	for _, unwanted := range []string{"debug", "proxy-protocol-listener", "prefer-ip", "[domain-fronting]", "[stats.prometheus]", "[throttle]", "[secret-ad-tags]", "api-token"} {
+	for _, unwanted := range []string{"debug", "proxy-protocol-listener", "prefer-ip", "[domain-fronting]", "[stats.prometheus]", "[throttle]", "[defense.pending-handshakes]", "[secret-ad-tags]", "api-token"} {
 		if strings.Contains(bare, unwanted) {
 			t.Fatalf("bare config should not contain %q:\n%s", unwanted, bare)
 		}
@@ -116,9 +155,10 @@ func TestRenderConfig(t *testing.T) {
 		Listen: "0.0.0.0", Port: 443,
 		Debug: true, ProxyProtocolListener: true, PreferIP: "only-ipv6",
 		FrontingIP: "127.0.0.1", FrontingPort: 9443, FrontingProxyProtocol: true,
-		ThrottleMaxConnections: 5000,
-		PublicIPv4:             "1.2.3.4",
-		PublicIPv6:             "2001:db8::1",
+		ThrottleMaxConnections:    5000,
+		PendingHandshakesMaxPerIP: 64,
+		PublicIPv4:                "1.2.3.4",
+		PublicIPv6:                "2001:db8::1",
 	}, 6000, "sesame")
 	for _, want := range []string{
 		"debug = true\n",
@@ -133,6 +173,7 @@ func TestRenderConfig(t *testing.T) {
 		"proxy-protocol = true\n",
 		"[throttle]",
 		"max-connections = 5000",
+		"[defense.pending-handshakes]\nmax-per-ip = 64\n",
 		"[secret-ad-tags]",
 		`"bob" = "fedcba9876543210fedcba9876543210"`,
 	} {
@@ -159,6 +200,9 @@ func TestRenderConfig(t *testing.T) {
 	}
 	if strings.LastIndex(full, "[secrets]") < strings.Index(full, "[throttle]") {
 		t.Fatalf("[throttle] must precede [secrets]:\n%s", full)
+	}
+	if strings.LastIndex(full, "[secrets]") < strings.Index(full, "[defense.pending-handshakes]") {
+		t.Fatalf("[defense.pending-handshakes] must precede [secrets]:\n%s", full)
 	}
 	if strings.LastIndex(full, "[secrets]") < strings.Index(full, "[secret-ad-tags]") {
 		t.Fatalf("[secret-ad-tags] must precede [secrets]:\n%s", full)
@@ -244,19 +288,20 @@ func TestFingerprintSplit(t *testing.T) {
 	base := Instance{Secrets: []SecretEntry{{Name: "a", Secret: "ee"}}, Listen: "0.0.0.0", Port: 443}
 
 	for name, mutate := range map[string]func(*Instance){
-		"debug":         func(i *Instance) { i.Debug = true },
-		"listener":      func(i *Instance) { i.ProxyProtocolListener = true },
-		"preferIp":      func(i *Instance) { i.PreferIP = "only-ipv4" },
-		"frontingIP":    func(i *Instance) { i.FrontingIP = "127.0.0.1" },
-		"frontingPort":  func(i *Instance) { i.FrontingPort = 9443 },
-		"frontingProxy": func(i *Instance) { i.FrontingProxyProtocol = true },
-		"throttle":      func(i *Instance) { i.ThrottleMaxConnections = 5000 },
-		"routeXray":     func(i *Instance) { i.RouteThroughXray = true },
-		"routeXrayPort": func(i *Instance) { i.XrayRoutePort = 50000 },
-		"port":          func(i *Instance) { i.Port = 8443 },
-		"listen":        func(i *Instance) { i.Listen = "127.0.0.1" },
-		"publicIpv4":    func(i *Instance) { i.PublicIPv4 = "1.2.3.4" },
-		"publicIpv6":    func(i *Instance) { i.PublicIPv6 = "2001:db8::1" },
+		"debug":             func(i *Instance) { i.Debug = true },
+		"listener":          func(i *Instance) { i.ProxyProtocolListener = true },
+		"preferIp":          func(i *Instance) { i.PreferIP = "only-ipv4" },
+		"frontingIP":        func(i *Instance) { i.FrontingIP = "127.0.0.1" },
+		"frontingPort":      func(i *Instance) { i.FrontingPort = 9443 },
+		"frontingProxy":     func(i *Instance) { i.FrontingProxyProtocol = true },
+		"throttle":          func(i *Instance) { i.ThrottleMaxConnections = 5000 },
+		"pendingHandshakes": func(i *Instance) { i.PendingHandshakesMaxPerIP = 64 },
+		"routeXray":         func(i *Instance) { i.RouteThroughXray = true },
+		"routeXrayPort":     func(i *Instance) { i.XrayRoutePort = 50000 },
+		"port":              func(i *Instance) { i.Port = 8443 },
+		"listen":            func(i *Instance) { i.Listen = "127.0.0.1" },
+		"publicIpv4":        func(i *Instance) { i.PublicIPv4 = "1.2.3.4" },
+		"publicIpv6":        func(i *Instance) { i.PublicIPv6 = "2001:db8::1" },
 	} {
 		t.Run("structural/"+name, func(t *testing.T) {
 			changed := base

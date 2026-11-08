@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 )
@@ -13,10 +14,7 @@ import (
 func TestSetRemoteTraffic_PreservesPanelLocalGroupAndComment(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -40,14 +38,12 @@ func TestSetRemoteTraffic_PreservesPanelLocalGroupAndComment(t *testing.T) {
 		t.Fatalf("create node inbound: %v", err)
 	}
 
-	if err := db.Create(&model.ClientRecord{
-		Email:   email,
-		UUID:    uid,
-		Enable:  true,
-		Group:   wantGroup,
-		Comment: wantComment,
-	}).Error; err != nil {
-		t.Fatalf("create client record: %v", err)
+	centralClients, err := (&InboundService{}).GetClients(central)
+	if err != nil {
+		t.Fatalf("parse central clients: %v", err)
+	}
+	if err := (&ClientService{}).SyncInbound(db, central.Id, centralClients); err != nil {
+		t.Fatalf("link client record: %v", err)
 	}
 
 	snap := &runtime.TrafficSnapshot{
@@ -82,10 +78,7 @@ func TestSetRemoteTraffic_PreservesPanelLocalGroupAndComment(t *testing.T) {
 func TestSyncInbound_KeepsGroupWhenIncomingEmpty(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -125,10 +118,7 @@ func TestSyncInbound_KeepsGroupWhenIncomingEmpty(t *testing.T) {
 func TestClientUpdate_ClearsGroup(t *testing.T) {
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
 	db := database.GetDB()
 
@@ -189,5 +179,24 @@ func TestClientUpdate_ClearsGroup(t *testing.T) {
 	}
 	if strings.Contains(ibAfter.Settings, `"group"`) {
 		t.Errorf("inbound settings still carry a group key after removal: %s", ibAfter.Settings)
+	}
+}
+
+// The groups page lists stored names but addresses a group by its trimmed name, so a
+// padded name from a node made actions on its row hit the real group.
+func TestSetRemoteTraffic_StoresTrimmedGroupName(t *testing.T) {
+	db := initTrafficTestDB(t)
+	seedNodeRow(t, db, &model.Node{Id: 1, Name: "n1", Address: "127.0.0.1", Port: 2096, ApiToken: "tok", Enable: true})
+	createNodeInbound(t, db, 1, "n1-in", 41001)
+
+	syncNodeWithSettings(t, &InboundService{}, 1, "n1-in",
+		`{"clients":[{"email":"who@x","id":"66666666-6666-4666-8666-666666666666","group":"vip\t","enable":true}]}`)
+
+	var row model.ClientRecord
+	if err := db.Where("email = ?", "who@x").First(&row).Error; err != nil {
+		t.Fatalf("lookup client: %v", err)
+	}
+	if row.Group != "vip" {
+		t.Fatalf("group stored as %q, want %q", row.Group, "vip")
 	}
 }

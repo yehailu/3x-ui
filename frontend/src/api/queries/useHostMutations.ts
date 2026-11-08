@@ -20,14 +20,19 @@ export function useHostMutations() {
 
   const updateMut = useMutation({
     mutationFn: ({ groupId, payload }: { groupId: string; payload: BulkAddHostValues }) =>
-      HttpUtil.post(`/panel/api/hosts/update/${groupId}`, payload, JSON_HEADERS),
+      HttpUtil.post(
+        `/panel/api/hosts/update/${encodeURIComponent(groupId)}`,
+        payload,
+        JSON_HEADERS,
+      ),
     onSuccess: (msg) => {
       if (msg?.success) invalidate();
     },
   });
 
   const removeMut = useMutation({
-    mutationFn: (groupId: string) => HttpUtil.post(`/panel/api/hosts/del/${groupId}`),
+    mutationFn: (groupId: string) =>
+      HttpUtil.post(`/panel/api/hosts/del/${encodeURIComponent(groupId)}`),
     onSuccess: (msg) => {
       if (msg?.success) invalidate();
     },
@@ -35,7 +40,7 @@ export function useHostMutations() {
 
   const setEnableMut = useMutation({
     mutationFn: ({ groupId, enable }: { groupId: string; enable: boolean }) =>
-      HttpUtil.post(`/panel/api/hosts/setEnable/${groupId}`, { enable }),
+      HttpUtil.post(`/panel/api/hosts/setEnable/${encodeURIComponent(groupId)}`, { enable }),
     onSuccess: (msg) => {
       if (msg?.success) invalidate();
     },
@@ -45,7 +50,7 @@ export function useHostMutations() {
     mutationFn: (groupIds: string[]) =>
       HttpUtil.post('/panel/api/hosts/reorder', { ids: groupIds }, JSON_HEADERS),
     onSuccess: (msg) => {
-      if (msg?.success) invalidate();
+      if (msg?.success) return invalidate();
     },
   });
 

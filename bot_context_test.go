@@ -1,7 +1,7 @@
 package main
 
-// The bot prompts under .github/workflows/ read .github/claude/repo-context.md
-// instead of restating repo facts; a stale claim there is invisible, so pin it.
+// The bot prompts and the files they read (issue-analyst-*.md, REVIEW.md) state
+// repo facts no build checks; a stale or oversized one fails silently, so pin them.
 
 import (
 	"os"
@@ -9,12 +9,16 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf16"
+
+	"github.com/goccy/go-yaml"
 )
 
 const (
-	botContextPath = ".github/claude/repo-context.md"
-	reviewPath     = "REVIEW.md"
-	ciWorkflowPath = ".github/workflows/ci.yml"
+	analystContextPath      = ".github/claude/issue-analyst-context.md"
+	analystInstructionsPath = ".github/claude/issue-analyst-instructions.md"
+	reviewPath              = "REVIEW.md"
+	ciWorkflowPath          = ".github/workflows/ci.yml"
 )
 
 func readRepoFile(t *testing.T, path string) string {
@@ -32,7 +36,7 @@ func section(t *testing.T, doc, from, to string) string {
 	t.Helper()
 	i := strings.Index(doc, from)
 	if i < 0 {
-		t.Fatalf("%s no longer contains the heading %q", botContextPath, from)
+		t.Fatalf("%s no longer contains the heading %q", analystContextPath, from)
 	}
 	rest := doc[i+len(from):]
 	if before, _, ok := strings.Cut(rest, to); ok {
@@ -41,18 +45,18 @@ func section(t *testing.T, doc, from, to string) string {
 	return rest
 }
 
-func TestBotContextLocaleFileCount(t *testing.T) {
-	doc := readRepoFile(t, botContextPath)
+func TestAnalystContextLocaleFileCount(t *testing.T) {
+	doc := readRepoFile(t, analystContextPath)
 	m := regexp.MustCompile("`internal/web/translation/` \\((\\d+) files\\)").FindStringSubmatch(doc)
 	if m == nil {
-		t.Fatalf("%s no longer states the locale file count as \"`internal/web/translation/` (N files)\"", botContextPath)
+		t.Fatalf("%s no longer states the locale file count as \"`internal/web/translation/` (N files)\"", analystContextPath)
 	}
 	files, err := filepath.Glob("internal/web/translation/*.json")
 	if err != nil {
 		t.Fatalf("glob locales: %v", err)
 	}
 	if got := len(files); m[1] != itoa(got) {
-		t.Errorf("%s claims %s locale files, internal/web/translation/ holds %d; update the claim and every prompt that relies on it", botContextPath, m[1], got)
+		t.Errorf("%s claims %s locale files, internal/web/translation/ holds %d; update the claim and every prompt that relies on it", analystContextPath, m[1], got)
 	}
 }
 
@@ -68,26 +72,26 @@ func itoa(n int) string {
 	return string(b)
 }
 
-func TestBotContextNamesRealCIJobs(t *testing.T) {
-	doc := readRepoFile(t, botContextPath)
+func TestAnalystContextNamesRealCIJobs(t *testing.T) {
+	doc := readRepoFile(t, analystContextPath)
 	ci := readRepoFile(t, ciWorkflowPath)
 	table := section(t, doc, "## What CI runs", "**What CI does NOT prove.**")
 	rows := regexp.MustCompile("(?m)^\\| `([a-z0-9-]+)` \\|").FindAllStringSubmatch(table, -1)
 	if len(rows) < 5 {
-		t.Fatalf("expected the CI table in %s to list at least 5 jobs, found %d", botContextPath, len(rows))
+		t.Fatalf("expected the CI table in %s to list at least 5 jobs, found %d", analystContextPath, len(rows))
 	}
 	for _, r := range rows {
 		t.Run(r[1], func(t *testing.T) {
 			if !strings.Contains(ci, "\n  "+r[1]+":\n") {
-				t.Errorf("%s describes a CI job %q that %s does not define", botContextPath, r[1], ciWorkflowPath)
+				t.Errorf("%s describes a CI job %q that %s does not define", analystContextPath, r[1], ciWorkflowPath)
 			}
 		})
 	}
 }
 
-func TestBotContextNamesRealPaths(t *testing.T) {
-	// REVIEW.md briefs the review job the way repo-context.md briefs the
-	// issue bot, so both get their paths pinned.
+func TestAnalystContextNamesRealPaths(t *testing.T) {
+	// REVIEW.md briefs the review job the way the two issue-analyst files brief
+	// the analyst, so all three get their paths pinned.
 	// internal/web/dist and frontend/node_modules are build output: absent from a
 	// fresh clone, created by `make dist-stub` and `npm ci`.
 	generated := map[string]bool{
@@ -97,7 +101,7 @@ func TestBotContextNamesRealPaths(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	counts := map[string]int{}
-	for _, src := range []string{botContextPath, reviewPath} {
+	for _, src := range []string{analystContextPath, analystInstructionsPath, reviewPath} {
 		for _, m := range regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(readRepoFile(t, src), -1) {
 			p := m[1]
 			if !regexp.MustCompile(`^(internal|frontend|docs|tools|\.github)/`).MatchString(p) ||
@@ -113,19 +117,19 @@ func TestBotContextNamesRealPaths(t *testing.T) {
 			})
 		}
 	}
-	if counts[botContextPath] < 20 {
-		t.Errorf("expected the bot context to name at least 20 repository paths, found %d - has the file been gutted?", counts[botContextPath])
+	if counts[analystContextPath] < 20 {
+		t.Errorf("expected the bot context to name at least 20 repository paths, found %d - has the file been gutted?", counts[analystContextPath])
 	}
 }
 
-func TestBotContextSkipGatesExist(t *testing.T) {
-	doc := readRepoFile(t, botContextPath)
+func TestAnalystContextSkipGatesExist(t *testing.T) {
+	doc := readRepoFile(t, analystContextPath)
 	table := section(t, doc, "**What CI does NOT prove.**", "Mutation testing")
 	// [A-Z0-9_] and not [A-Z_]: XRAY_E2E_BINARY carries a digit, and excluding it
 	// silently dropped that gate from the check instead of failing.
 	gates := regexp.MustCompile("`((?:XUI|XRAY)_[A-Z0-9_]+)`").FindAllStringSubmatch(table, -1)
 	if len(gates) < 5 {
-		t.Fatalf("expected at least 5 skip-gate variables in %s, found %d", botContextPath, len(gates))
+		t.Fatalf("expected at least 5 skip-gate variables in %s, found %d", analystContextPath, len(gates))
 	}
 	var sources []string
 	err := filepath.WalkDir("internal", func(path string, d os.DirEntry, err error) error {
@@ -147,7 +151,7 @@ func TestBotContextSkipGatesExist(t *testing.T) {
 					return
 				}
 			}
-			t.Errorf("%s lists %s as a test skip gate, but no .go file under internal/ reads it", botContextPath, g[1])
+			t.Errorf("%s lists %s as a test skip gate, but no .go file under internal/ reads it", analystContextPath, g[1])
 		})
 	}
 }
@@ -192,5 +196,46 @@ func TestReviewLocaleFileCount(t *testing.T) {
 	}
 	if got := len(files); m[1] != itoa(got) {
 		t.Errorf("%s tells the reviewer to expect %s locale files, internal/web/translation/ holds %d", reviewPath, m[1], got)
+	}
+}
+
+// GitHub rejects the whole workflow once a value holding ${{ }} passes 21,000
+// characters, so every trigger fails with no job to read; actionlint misses it.
+func TestBotPromptsFitGitHubExpressionLimit(t *testing.T) {
+	const limit = 21000
+	files, err := filepath.Glob(".github/workflows/claude-*.yml")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("glob bot workflows: %v (%d files)", err, len(files))
+	}
+	checked := 0
+	for _, path := range files {
+		var wf struct {
+			Jobs map[string]struct {
+				Steps []struct {
+					With map[string]any `yaml:"with"`
+				} `yaml:"steps"`
+			} `yaml:"jobs"`
+		}
+		if err := yaml.Unmarshal([]byte(readRepoFile(t, path)), &wf); err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for job, j := range wf.Jobs {
+			for _, step := range j.Steps {
+				for key, v := range step.With {
+					s, ok := v.(string)
+					if !ok || !strings.Contains(s, "${{") {
+						continue
+					}
+					checked++
+					// GitHub counts .NET string length: UTF-16 code units.
+					if n := len(utf16.Encode([]rune(s))); n > limit {
+						t.Errorf("%s job %s with.%s is %d characters; GitHub rejects the workflow over %d", path, job, key, n, limit)
+					}
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no ${{ }} value found in the bot workflows: the parse no longer reaches the prompts")
 	}
 }

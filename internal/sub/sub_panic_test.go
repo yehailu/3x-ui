@@ -68,7 +68,7 @@ func TestGetJsonToleratesHysteriaWithoutHysteriaSettings(t *testing.T) {
 		t.Fatalf("seed client_inbound: %v", err)
 	}
 
-	jsonService := NewSubJsonService("", "", "", NewSubService(""))
+	jsonService := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := jsonService.GetJson(subId, "sub.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -83,7 +83,7 @@ func TestGetJsonToleratesNonStringRealityShortId(t *testing.T) {
 	stream := `{"network":"tcp","security":"reality","realitySettings":{"serverNames":["sni.example.com"],"shortIds":[42],"settings":{"publicKey":"pk"}}}`
 	seedSubInbound(t, "rlty1", "rlty", 46400, 1, stream)
 
-	jsonService := NewSubJsonService("", "", "", NewSubService(""))
+	jsonService := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := jsonService.GetJson("rlty1", "sub.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -99,7 +99,7 @@ func TestGetClashEmitsPinnedCertSha256(t *testing.T) {
 	stream := `{"network":"tcp","security":"tls","tlsSettings":{"serverName":"pin.sni","settings":{"pinnedPeerCertSha256":["` + pin + `"]}}}`
 	seedSubInbound(t, "pin1", "pin", 46300, 1, stream)
 
-	out, _, err := NewSubClashService(false, "", NewSubService("")).GetClash("pin1", "sub.example.com")
+	out, _, err := NewSubClashService(false, "", false, NewSubService("")).GetClash("pin1", "sub.example.com")
 	if err != nil {
 		t.Fatalf("GetClash: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestJsonAndClashTolerateExternalProxyMissingPort(t *testing.T) {
 	stream := `{"network":"tcp","security":"none","externalProxy":[{"forceTls":"same","dest":"cdn.example.com"}]}`
 	seedSubInbound(t, "extp1", "extp", 46500, 1, stream)
 
-	jsonService := NewSubJsonService("", "", "", NewSubService(""))
+	jsonService := NewSubJsonService("", "", "", "", NewSubService(""))
 	jsonOut, _, err := jsonService.GetJson("extp1", "sub.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -122,7 +122,7 @@ func TestJsonAndClashTolerateExternalProxyMissingPort(t *testing.T) {
 		t.Fatal("GetJson returned empty for an externalProxy entry missing port")
 	}
 
-	clashOut, _, err := NewSubClashService(false, "", NewSubService("")).GetClash("extp1", "sub.example.com")
+	clashOut, _, err := NewSubClashService(false, "", false, NewSubService("")).GetClash("extp1", "sub.example.com")
 	if err != nil {
 		t.Fatalf("GetClash: %v", err)
 	}

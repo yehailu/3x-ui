@@ -6,6 +6,8 @@
     "ssl-certificates",
     "inbounds",
     "reality",
+    "tuic",
+    "masque",
     "transports",
     "clients",
     "subscription",

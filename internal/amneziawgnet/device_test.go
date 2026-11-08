@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	awgconn "github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -40,7 +39,7 @@ func TestNewDeviceHandshakeForwarderAndIdentity(t *testing.T) {
 		t.Fatalf("generate client keypair: %v", err)
 	}
 
-	const listenPort = 58712 // fixed loopback test port, matches the validated Phase 0 spike approach
+	listenPort := freeUDPPort(t)
 	const wantEmail = "test-peer@example.com"
 
 	inst := amneziawg.Instance{
@@ -81,14 +80,9 @@ func TestNewDeviceHandshakeForwarderAndIdentity(t *testing.T) {
 	// purely from the decapsulated packet, not from any routing table.
 	wantDest := netip.MustParseAddrPort("10.201.9.9:9999")
 
-	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
+	AttachTCPForwarder(dev.Stack, ownerBySource, func(conn *gonet.TCPConn, src, dest netip.AddrPort) {
 		defer conn.Close()
-		srcAddrPort, parseErr := netip.ParseAddrPort(conn.RemoteAddr().String())
-		var peer amneziawg.Peer
-		var ok bool
-		if parseErr == nil {
-			peer, ok = idx.Lookup(srcAddrPort.Addr().Unmap())
-		}
+		peer, ok := idx.Lookup(src.Addr().Unmap())
 		got <- recovered{email: peer.Email, ok: ok, dest: dest}
 		io.Copy(io.Discard, conn)
 	})
@@ -107,7 +101,7 @@ func TestNewDeviceHandshakeForwarderAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
@@ -191,7 +185,12 @@ func TestBuildUAPIConfigHeaderProtectionAndContentPaddingLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildUAPIConfig with empty options: %v", err)
 	}
-	if strings.Contains(conf, "header_protection_key=") || strings.Contains(conf, "content_padding_addition=") {
+	// header_protection_key is the exception: an omitted line reads as
+	// "unchanged", so clearing the key has to be sent as the all-zero one.
+	if !strings.Contains(conf, "header_protection_key="+strings.Repeat("0", 64)+"\n") {
+		t.Fatalf("an unset key must be emitted as the all-zero key, got:\n%s", conf)
+	}
+	if strings.Contains(conf, "content_padding_addition=") {
 		t.Fatalf("empty DeviceOptions must not emit AWG 3.0 lines, got:\n%s", conf)
 	}
 
@@ -244,7 +243,7 @@ func TestNewDeviceHeaderProtectionAndContentPaddingRoundTrip(t *testing.T) {
 		t.Fatalf("generate header protection key: %v", err)
 	}
 
-	const listenPort = 58713 // fixed loopback test port, distinct from the handshake test above
+	listenPort := freeUDPPort(t)
 	const contentPaddingAddition = "20-40"
 
 	inst := amneziawg.Instance{
@@ -279,7 +278,7 @@ func TestNewDeviceHeaderProtectionAndContentPaddingRoundTrip(t *testing.T) {
 	const wantRequest = "hello from client"
 	const wantReply = "hello from server"
 	serverDone := make(chan error, 1)
-	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
+	AttachTCPForwarder(dev.Stack, ownerBySource, func(conn *gonet.TCPConn, _, dest netip.AddrPort) {
 		defer conn.Close()
 		buf := make([]byte, len(wantRequest))
 		if _, err := io.ReadFull(conn, buf); err != nil {
@@ -309,7 +308,7 @@ func TestNewDeviceHeaderProtectionAndContentPaddingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
@@ -430,7 +429,7 @@ func TestNewDeviceRandomTrailersAndDisableCookiesRoundTrip(t *testing.T) {
 		t.Fatalf("generate client keypair: %v", err)
 	}
 
-	const listenPort = 58721 // fixed loopback test port, distinct from every other test in this package
+	listenPort := freeUDPPort(t)
 
 	inst := amneziawg.Instance{
 		Id:            3,
@@ -457,7 +456,7 @@ func TestNewDeviceRandomTrailersAndDisableCookiesRoundTrip(t *testing.T) {
 	const wantRequest = "hello from client, with a trailer"
 	const wantReply = "hello from server, with a trailer"
 	serverDone := make(chan error, 1)
-	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
+	AttachTCPForwarder(dev.Stack, ownerBySource, func(conn *gonet.TCPConn, _, dest netip.AddrPort) {
 		defer conn.Close()
 		buf := make([]byte, len(wantRequest))
 		if _, err := io.ReadFull(conn, buf); err != nil {
@@ -487,7 +486,7 @@ func TestNewDeviceRandomTrailersAndDisableCookiesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
@@ -579,9 +578,20 @@ func TestValidatedObfuscationAlwaysApplies(t *testing.T) {
 		{"I1 chained tags", func(o *amneziawg.Obfuscation31) { o.I1 = "<b ff00><r 10>" }},
 		{"I1 valueless tag", func(o *amneziawg.Obfuscation31) { o.I1 = "<t><rc 5>" }},
 		{"I1 no tags at all", func(o *amneziawg.Obfuscation31) { o.I1 = "plain text" }},
+		{"H ranges overlap", func(o *amneziawg.Obfuscation31) { o.H1, o.H2 = "100-200", "150-300" }},
+		{"H1 equals the blank H3 default", func(o *amneziawg.Obfuscation31) { o.H1 = "3" }},
+		{"H1-H4 = WireGuard's 1-4", func(o *amneziawg.Obfuscation31) { o.H1, o.H2, o.H3, o.H4 = "1", "2", "3", "4" }},
+		// Separate cases: 1552+56 == 1608, so both maxima together trip the S1/S2 size rule.
+		{"S1 and S3 at the 1700-byte bound", func(o *amneziawg.Obfuscation31) { o.S1, o.S3 = 1552, 1636 }},
+		{"S2 at the 1700-byte bound", func(o *amneziawg.Obfuscation31) { o.S2 = 1608 }},
+		{"Amnezia Premium set", func(o *amneziawg.Obfuscation31) {
+			o.S1, o.S2, o.S3, o.S4 = 284, 659, 1045, 12
+			o.H1, o.H2, o.H3, o.H4 = "1", "2", "3", "4"
+			o.HeaderProtectionKey = "A2lG0Jm3m8u1WJt0qg3d7V6Qx8cFvH9pL1nR4sT6yZ0="
+		}},
 	}
 
-	for i, tc := range cases {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			o := base
 			tc.mut(&o)
@@ -589,7 +599,7 @@ func TestValidatedObfuscationAlwaysApplies(t *testing.T) {
 				return // rejected before saving, which is the whole point
 			}
 			inst := amneziawg.Instance{
-				Id: 88, InterfaceName: "awgcontract", ListenPort: 58900 + i,
+				Id: 88, InterfaceName: "awgcontract", ListenPort: 0,
 				PrivateKey: priv, PublicKey: pub,
 				Address: []string{"10.198.0.1/24"}, MTU: 1420,
 				Obfuscation: o,
@@ -622,5 +632,58 @@ func TestValidatedObfuscationAlwaysApplies(t *testing.T) {
 				t.Fatalf("ValidateObfuscation accepted this config but amneziawg-go rejected it: %v", err)
 			}
 		})
+	}
+}
+
+// Clearing HeaderProtectionKey on a running inbound must actually reach the
+// device: amneziawg-go treats an absent UAPI line as "keep the current value",
+// so an omitted key leaves header protection permanently on. Worse, the stale
+// key keeps the S1-S4 minimum alive, so lowering them then fails IpcSet with
+// -22 on every reconcile after the peers were already replaced.
+func TestBuildUAPIConfigClearedHeaderProtectionKeyIsSentAsZero(t *testing.T) {
+	priv, _, err := wireguard.GenerateWireguardKeypair()
+	if err != nil {
+		t.Fatalf("generate keypair: %v", err)
+	}
+	inst := amneziawg.Instance{
+		PrivateKey:  priv,
+		Obfuscation: amneziawg.Obfuscation31{S1: 20, S2: 20, S3: 20, S4: 20},
+	}
+
+	key, err := wireguard.GenerateWireguardPSK()
+	if err != nil {
+		t.Fatalf("generate header protection key: %v", err)
+	}
+	withKey, err := buildUAPIConfig(inst, DeviceOptions{HeaderProtectionKey: key})
+	if err != nil {
+		t.Fatalf("buildUAPIConfig with a key: %v", err)
+	}
+	cleared, err := buildUAPIConfig(inst, DeviceOptions{})
+	if err != nil {
+		t.Fatalf("buildUAPIConfig with the key cleared: %v", err)
+	}
+	if withKey == cleared {
+		t.Fatal("clearing the key produced an identical UAPI config, so the device would never see the change")
+	}
+
+	zero := "header_protection_key=" + strings.Repeat("0", 64) + "\n"
+	if !strings.Contains(cleared, zero) {
+		t.Fatalf("cleared config must carry the all-zero key, got:\n%s", cleared)
+	}
+	if strings.Contains(withKey, zero) {
+		t.Fatalf("a configured key must not be emitted as zero, got:\n%s", withKey)
+	}
+}
+
+// A row stored before the handshake bounds existed must fail its own device setup instead
+// of allocating without limit at the next handshake, which ended the whole panel.
+func TestBuildUAPIConfigRefusesAStoredUnboundedPreamble(t *testing.T) {
+	priv, _, err := wireguard.GenerateWireguardKeypair()
+	if err != nil {
+		t.Fatalf("generate keypair: %v", err)
+	}
+	inst := amneziawg.Instance{PrivateKey: priv, Obfuscation: amneziawg.Obfuscation31{Jc: 1 << 31, Jmin: 10, Jmax: 20}}
+	if _, err := buildUAPIConfig(inst, DeviceOptions{}); err == nil {
+		t.Fatal("a stored Jc of 2^31 reached the device")
 	}
 }

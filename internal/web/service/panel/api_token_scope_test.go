@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/crypto"
 )
@@ -14,14 +15,7 @@ func setupAPITokenTestDB(t *testing.T) {
 	t.Helper()
 	dbDir := t.TempDir()
 	t.Setenv("XUI_DB_FOLDER", dbDir)
-	if err := database.InitDB(filepath.Join(dbDir, "x-ui.db")); err != nil {
-		t.Fatalf("InitDB: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := database.CloseDB(); err != nil {
-			t.Fatalf("CloseDB: %v", err)
-		}
-	})
+	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 }
 
 func TestAPITokenScopeExpiryAndExpectedRevoke(t *testing.T) {
@@ -86,6 +80,23 @@ func TestAPITokenScopeExpiryAndExpectedRevoke(t *testing.T) {
 	}
 	if _, ok := svc.MatchToken(created.Token); ok {
 		t.Fatal("disabled token still matched")
+	}
+}
+
+func TestAPITokenNodeAdminScopeRoundTrips(t *testing.T) {
+	setupAPITokenTestDB(t)
+	svc := &ApiTokenService{}
+
+	created, err := svc.Create("node-updater", model.ApiScopeNodeAdmin, 0)
+	if err != nil {
+		t.Fatalf("create node-admin token: %v", err)
+	}
+	row, ok := svc.MatchToken(created.Token)
+	if !ok {
+		t.Fatal("fresh node-admin token did not authenticate")
+	}
+	if created.Scope != model.ApiScopeNodeAdmin || row.Scope != model.ApiScopeNodeAdmin {
+		t.Fatalf("created/matched scopes = %q/%q, want node-admin/node-admin", created.Scope, row.Scope)
 	}
 }
 

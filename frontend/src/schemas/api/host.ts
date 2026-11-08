@@ -28,6 +28,8 @@ export const HostFormSchema = z.object({
 
   security: HostSecuritySchema.default('same'),
   sni: z.string().default(''),
+  snis: z.array(z.string()).default([]),
+  sniSharedRandom: z.boolean().default(false),
   hostHeader: z.string().default(''),
   path: z.string().default(''),
   alpn: z.array(AlpnSchema).default([]),
@@ -35,6 +37,7 @@ export const HostFormSchema = z.object({
     (val) => (val === '' ? undefined : val),
     UtlsFingerprintSchema.optional(),
   ),
+  cipherSuites: z.string().default(''),
   overrideSniFromAddress: z.boolean().default(false),
   keepSniBlank: z.boolean().default(false),
   pinnedPeerCertSha256: z.array(z.string()).default([]),
@@ -66,6 +69,7 @@ export const HostFormSchema = z.object({
   ),
   mihomoX25519: z.boolean().default(false),
   shuffleHost: z.boolean().default(false),
+  randomCount: z.number().int().min(1).max(100).default(1),
 });
 export type HostFormValues = z.infer<typeof HostFormSchema>;
 
@@ -83,10 +87,13 @@ export const HostRecordSchema = z
     port: z.number().optional(),
     security: z.string().optional(),
     sni: z.string().optional(),
+    snis: z.array(z.string()).nullish(),
+    sniSharedRandom: z.boolean().optional(),
     hostHeader: z.string().optional(),
     path: z.string().optional(),
     alpn: z.array(z.string()).nullish(),
     fingerprint: z.string().optional(),
+    cipherSuites: z.string().optional(),
     overrideSniFromAddress: z.boolean().optional(),
     keepSniBlank: z.boolean().optional(),
     pinnedPeerCertSha256: z.array(z.string()).nullish(),
@@ -105,6 +112,7 @@ export const HostRecordSchema = z
     mihomoIpVersion: z.string().optional(),
     mihomoX25519: z.boolean().optional(),
     shuffleHost: z.boolean().optional(),
+    randomCount: z.number().optional(),
   })
   .loose();
 export type HostRecord = z.infer<typeof HostRecordSchema>;

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	awgconn "github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -35,7 +34,7 @@ func TestNewDeviceUDPHandlerAndReply(t *testing.T) {
 		t.Fatalf("generate client keypair: %v", err)
 	}
 
-	const listenPort = 58713 // distinct from the TCP test's port
+	listenPort := freeUDPPort(t)
 	const wantEmail = "udp-test-peer@example.com"
 	const echoPayload = "hello-from-client"
 
@@ -98,7 +97,7 @@ func TestNewDeviceUDPHandlerAndReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)

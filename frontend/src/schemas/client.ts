@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { OptionalClientKeepAliveSchema } from '@/schemas/primitives/keepalive';
 
 const nullableStringArray = z
   .array(z.string())
@@ -31,6 +32,8 @@ export const ClientRecordSchema = z
     auth: z.string().optional(),
     flow: z.string().optional(),
     security: z.string().optional(),
+    // Host rules the client is bound to; null/omitted preserves, empty clears.
+    clientHostRuleIds: z.array(z.number().int()).nullable().optional(),
     totalGB: z.number().optional(),
     expiryTime: z.number().optional(),
     limitIp: z.number().optional(),
@@ -41,6 +44,7 @@ export const ClientRecordSchema = z
     enable: z.boolean().optional(),
     reset: z.number().optional(),
     resetDay: z.number().optional(),
+    resetWeekday: z.number().optional(),
     resetMax: z.number().optional(),
     trafficReset: z.string().optional(),
     trafficResetDay: z.number().optional(),
@@ -51,7 +55,7 @@ export const ClientRecordSchema = z
     publicKey: z.string().optional(),
     allowedIPs: z.string().optional(),
     preSharedKey: z.string().optional(),
-    keepAlive: z.number().optional(),
+    keepAlive: OptionalClientKeepAliveSchema,
     forwardedPorts: z.string().optional(),
     secret: z.string().optional(),
     adTag: z.string().optional(),
@@ -101,6 +105,23 @@ export const AwgServerOptionSchema = z
   })
   .loose();
 
+export const TuicServerOptionSchema = z
+  .object({
+    certificate: z.string().optional(),
+    congestion_control: z.string().optional(),
+    alpn: z.array(z.string()).optional(),
+    udp_relay_mode: z.string().optional(),
+    zero_rtt_handshake: z.boolean().optional(),
+    log_level: z.string().optional(),
+    max_idle_time: z.number().optional(),
+    authentication_timeout: z.number().optional(),
+    max_udp_relay_packet_size: z.number().optional(),
+    sni: z.string().optional(),
+  })
+  .loose();
+
+export type TuicServerOption = z.infer<typeof TuicServerOptionSchema>;
+
 export const InboundOptionSchema = z
   .object({
     id: z.number(),
@@ -108,12 +129,15 @@ export const InboundOptionSchema = z
     tag: z.string().optional(),
     protocol: z.string().optional(),
     port: z.number().optional(),
+    network: z.string().optional(),
+    security: z.string().optional(),
     tlsFlowCapable: z.boolean().optional(),
     ssMethod: z.string().optional(),
     wgPublicKey: z.string().optional(),
     wgMtu: z.number().optional(),
     wgDns: z.string().optional(),
     awgServer: AwgServerOptionSchema.nullable().optional(),
+    tuicServer: TuicServerOptionSchema.nullable().optional(),
     mtprotoDomain: z.string().optional(),
     // Hosting node id; absent/null for this panel's own inbounds (#4997).
     nodeId: z.number().nullable().optional(),
@@ -295,6 +319,7 @@ export const ClientFormSchema = z.object({
     .string()
     .trim()
     .min(1, 'pages.clients.email')
+    .refine((v) => v !== '.' && v !== '..', 'pages.clients.emailReservedName')
     .refine((v) => !hasForbiddenClientChars(v), 'pages.clients.emailInvalidChars'),
   subId: z.string().refine((v) => !hasForbiddenClientChars(v), 'pages.clients.subIdInvalidChars'),
   uuid: z.string(),
@@ -302,12 +327,15 @@ export const ClientFormSchema = z.object({
   auth: z.string(),
   flow: z.string(),
   security: z.string(),
+  // Host rules the client is bound to; null/omitted preserves, empty clears.
+  clientHostRuleIds: z.array(z.number().int()).nullable().optional(),
   reverseTag: z.string(),
   totalGB: z.number().min(0),
   delayedStart: z.boolean(),
   delayedDays: z.number().int().min(0),
   reset: z.number().int().min(0),
   resetDay: z.number().int().min(0).max(31),
+  resetWeekday: z.number().int().min(0).max(7),
   resetMax: z.number().int().min(0),
   trafficReset: z.enum(['never', 'hourly', 'daily', 'weekly', 'monthly']),
   trafficResetDay: z.number().int().min(1).max(31),
@@ -329,10 +357,31 @@ export const ClientBulkAdjustFormSchema = z
     addDays: z.number().int(),
     addGB: z.number(),
     flow: z.string().optional().default(''),
+    limitHwid: z.number().int().min(0).nullable().optional(),
+    adTag: z.string().optional().default(''),
   })
-  .refine((v) => v.addDays !== 0 || v.addGB !== 0 || v.flow !== '', {
-    message: 'pages.clients.bulkAdjustNothing',
-  });
+  .refine(
+    (v) =>
+      v.addDays !== 0 ||
+      v.addGB !== 0 ||
+      v.flow !== '' ||
+      (v.limitHwid !== undefined && v.limitHwid !== null) ||
+      (v.adTag !== undefined && v.adTag.trim() !== ''),
+    {
+      error: 'pages.clients.bulkAdjustNothing',
+    },
+  )
+  .refine(
+    (v) => {
+      const tag = v.adTag?.trim();
+      if (!tag || tag === 'none') return true;
+      return /^[0-9a-fA-F]{32}$/.test(tag);
+    },
+    {
+      error: 'pages.inbounds.form.mtgAdTagInvalid',
+      path: ['adTag'],
+    },
+  );
 
 export const ClientBulkAddFormSchema = z.object({
   emailMethod: z.number().int().min(0).max(4),
@@ -351,6 +400,7 @@ export const ClientBulkAddFormSchema = z.object({
   expiryTime: z.number(),
   reset: z.number().int().min(0),
   resetDay: z.number().int().min(0).max(31),
+  resetWeekday: z.number().int().min(0).max(7),
   resetMax: z.number().int().min(0),
   trafficReset: z.enum(['never', 'hourly', 'daily', 'weekly', 'monthly']).optional(),
   trafficResetDay: z.number().int().min(1).max(31).optional(),

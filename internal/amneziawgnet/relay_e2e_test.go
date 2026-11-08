@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	awgconn "github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -78,7 +77,7 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 		t.Fatalf("generate client keypair: %v", err)
 	}
 
-	const listenPort = 58715
+	listenPort := freeUDPPort(t)
 	inst := amneziawg.Instance{
 		Id:            4,
 		InterfaceName: "awgtest4",
@@ -162,13 +161,8 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 	udpRelay := NewUDPRelay(relay, dev.Stack)
 	defer udpRelay.Close()
 
-	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
-		srcAddrPort, err := netip.ParseAddrPort(conn.RemoteAddr().String())
-		if err != nil {
-			conn.Close()
-			return
-		}
-		peer, ok := idx.Lookup(srcAddrPort.Addr().Unmap())
+	AttachTCPForwarder(dev.Stack, ownerBySource, func(conn *gonet.TCPConn, src, dest netip.AddrPort) {
+		peer, ok := idx.Lookup(src.Addr().Unmap())
 		if !ok {
 			conn.Close()
 			return
@@ -196,7 +190,7 @@ func TestSocksRelayAgainstRealXray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
@@ -311,7 +305,7 @@ func TestManagerEnsureAutomaticallyWiresRelay(t *testing.T) {
 	}
 
 	const wantEmail = "manager-e2e-peer@example.com"
-	const listenPort = 58716
+	listenPort := freeUDPPort(t)
 	const inboundID = 5
 
 	tcpEcho, tcpEchoAddr := startTCPEcho(t, localIP)
@@ -421,7 +415,7 @@ func TestManagerEnsureAutomaticallyWiresRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 	defer clientDev.Close()
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
@@ -599,6 +593,39 @@ func freePort(t *testing.T) int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+// freeUDPPort asks the OS for a free loopback UDP port: a fixed one sits in the
+// Linux ephemeral range, where any concurrent :0 socket can already hold it.
+func freeUDPPort(tb testing.TB) int {
+	tb.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer pc.Close()
+	return pc.LocalAddr().(*net.UDPAddr).Port
+}
+
+// freeTCPUDPPort finds a loopback port free for both protocols, since a port
+// forward binds a TCP and a UDP listener on the same number.
+func freeTCPUDPPort(t *testing.T) int {
+	t.Helper()
+	for range 20 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		pc, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		l.Close()
+		if err == nil {
+			pc.Close()
+			return port
+		}
+	}
+	t.Fatal("no loopback port free for both TCP and UDP")
+	return 0
 }
 
 func waitForPort(t *testing.T, port int) {

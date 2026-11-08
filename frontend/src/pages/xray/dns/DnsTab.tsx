@@ -23,6 +23,7 @@ import {
   SettingOutlined,
 } from '@ant-design/icons';
 
+import { selectTagRender } from '@/components/form';
 import { onNumber } from '@/utils/onNumber';
 import { SettingListItem } from '@/components/ui';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
@@ -245,7 +246,11 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
     const out = [
       {
         key: '1',
-        label: catTabLabel(<SettingOutlined />, t('pages.xray.generalConfigs'), isMobile),
+        label: catTabLabel(
+          <SettingOutlined aria-hidden />,
+          t('pages.xray.generalConfigs'),
+          isMobile,
+        ),
         children: (
           <>
             <SettingListItem
@@ -294,6 +299,18 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
                       style={{ width: '100%' }}
                       options={STRATEGIES.map((s) => ({ value: s, label: s }))}
                       onChange={(v) => setDnsField('queryStrategy', v)}
+                    />
+                  }
+                />
+                <SettingListItem
+                  paddings="small"
+                  title={t('pages.xray.dns.script')}
+                  description={t('pages.xray.dns.scriptDesc')}
+                  control={
+                    <Input
+                      value={dns?.script ?? ''}
+                      placeholder="dns.lua"
+                      onChange={(e) => setDnsField('script', e.target.value, true)}
                     />
                   }
                 />
@@ -364,13 +381,13 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
     if (dnsEnabled) {
       out.push({
         key: 'hosts',
-        label: catTabLabel(<ProfileOutlined />, t('pages.xray.dns.hosts'), isMobile),
+        label: catTabLabel(<ProfileOutlined aria-hidden />, t('pages.xray.dns.hosts'), isMobile),
         children:
           hostsList.length === 0 ? (
             <Empty description={t('pages.xray.dns.hostsEmpty')}>
               <Button
                 type="primary"
-                icon={<PlusOutlined />}
+                icon={<PlusOutlined aria-hidden />}
                 onClick={() => syncHosts([...hostsList, { domain: '', values: [] }])}
               >
                 {t('pages.xray.dns.hostsAdd')}
@@ -380,7 +397,7 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
             <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
               <Button
                 type="primary"
-                icon={<PlusOutlined />}
+                icon={<PlusOutlined aria-hidden />}
                 onClick={() => syncHosts([...hostsList, { domain: '', values: [] }])}
               >
                 {t('pages.xray.dns.hostsAdd')}
@@ -401,6 +418,7 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
                   />
                   <Select
                     mode="tags"
+                    tagRender={selectTagRender}
                     value={row.values}
                     aria-label={t('pages.xray.dns.hostsValues')}
                     placeholder={t('pages.xray.dns.hostsValues')}
@@ -414,7 +432,7 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
                   <Button
                     danger
                     aria-label={t('delete')}
-                    icon={<DeleteOutlined />}
+                    icon={<DeleteOutlined aria-hidden />}
                     onClick={() => syncHosts(hostsList.filter((_, i) => i !== idx))}
                   />
                 </div>
@@ -425,15 +443,18 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
 
       out.push({
         key: '2',
-        label: catTabLabel(<DatabaseOutlined />, 'DNS', isMobile),
+        label: catTabLabel(<DatabaseOutlined aria-hidden />, 'DNS', isMobile),
         children:
           dnsServers.length === 0 ? (
             <Empty description={t('emptyDnsDesc')}>
               <Space>
-                <Button type="primary" icon={<PlusOutlined />} onClick={openAddServer}>
+                <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={openAddServer}>
                   {t('pages.xray.dns.add')}
                 </Button>
-                <Button icon={<MenuOutlined />} onClick={() => setPresetsModalOpen(true)}>
+                <Button
+                  icon={<MenuOutlined aria-hidden />}
+                  onClick={() => setPresetsModalOpen(true)}
+                >
                   {t('pages.xray.dns.usePreset')}
                 </Button>
               </Space>
@@ -441,13 +462,16 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
           ) : (
             <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
               <Space wrap>
-                <Button type="primary" icon={<PlusOutlined />} onClick={openAddServer}>
+                <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={openAddServer}>
                   {t('pages.xray.dns.add')}
                 </Button>
-                <Button icon={<MenuOutlined />} onClick={() => setPresetsModalOpen(true)}>
+                <Button
+                  icon={<MenuOutlined aria-hidden />}
+                  onClick={() => setPresetsModalOpen(true)}
+                >
                   {t('pages.xray.dns.usePreset')}
                 </Button>
-                <Button danger icon={<DeleteOutlined />} onClick={clearAllServers}>
+                <Button danger icon={<DeleteOutlined aria-hidden />} onClick={clearAllServers}>
                   {t('pages.xray.dns.clearAll')}
                 </Button>
               </Space>
@@ -465,17 +489,17 @@ export default function DnsTab({ templateSettings, setTemplateSettings }: DnsTab
 
       out.push({
         key: '3',
-        label: catTabLabel(<ExperimentOutlined />, 'Fake DNS', isMobile),
+        label: catTabLabel(<ExperimentOutlined aria-hidden />, 'Fake DNS', isMobile),
         children:
           fakeDnsList.length === 0 ? (
             <Empty description={t('emptyFakeDnsDesc')}>
-              <Button type="primary" icon={<PlusOutlined />} onClick={addFakedns}>
+              <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={addFakedns}>
                 {t('pages.xray.fakedns.add')}
               </Button>
             </Empty>
           ) : (
             <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
-              <Button type="primary" icon={<PlusOutlined />} onClick={addFakedns}>
+              <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={addFakedns}>
                 {t('pages.xray.fakedns.add')}
               </Button>
               <Table

@@ -1,5 +1,14 @@
 package service
 
+import (
+	"strings"
+
+	"gorm.io/gorm"
+
+	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/xray"
+)
+
 // sqliteMaxVars is a safe ceiling for the number of bind parameters in a
 // single SQL statement. SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 on builds
 // before 3.32 and 32766 after; staying under 999 keeps queries portable
@@ -7,11 +16,10 @@ package service
 // installs (>32k clients) where even modern SQLite would refuse a single IN.
 const sqliteMaxVars = 900
 
-// normalizeSubSortIndex clamps the 1-based subscription sort order. Values
-// below 1 arrive from clients that predate the field (omitted form key binds
-// to 0) and must not sort ahead of explicitly ranked inbounds.
+// normalizeSubSortIndex maps omitted/zero to 1; explicit negatives are kept
+// so a primary inbound can sort ahead of the default.
 func normalizeSubSortIndex(v int) int {
-	if v < 1 {
+	if v == 0 {
 		return 1
 	}
 	return v
@@ -38,6 +46,16 @@ func uniqueNonEmptyStrings(in []string) []string {
 	return out
 }
 
+// trimmedUniqueEmails trims each address before deduplicating, so the bulk
+// client operations treat " a@x " and "a@x" as the same row.
+func trimmedUniqueEmails(in []string) []string {
+	trimmed := make([]string, 0, len(in))
+	for _, e := range in {
+		trimmed = append(trimmed, strings.TrimSpace(e))
+	}
+	return uniqueNonEmptyStrings(trimmed)
+}
+
 // uniqueInts returns a deduplicated copy of in, preserving order of first occurrence.
 func uniqueInts(in []int) []int {
 	if len(in) == 0 {
@@ -61,7 +79,7 @@ func chunkStrings(s []string, size int) [][]string {
 	if size <= 0 || len(s) == 0 {
 		return nil
 	}
-	out := make([][]string, 0, (len(s)+size-1)/size)
+	out := make([][]string, 0, chunkCount(len(s), size))
 	for i := 0; i < len(s); i += size {
 		end := min(i+size, len(s))
 		out = append(out, s[i:end])
@@ -75,10 +93,54 @@ func chunkInts(s []int, size int) [][]int {
 	if size <= 0 || len(s) == 0 {
 		return nil
 	}
-	out := make([][]int, 0, (len(s)+size-1)/size)
+	out := make([][]int, 0, chunkCount(len(s), size))
 	for i := 0; i < len(s); i += size {
 		end := min(i+size, len(s))
 		out = append(out, s[i:end])
 	}
 	return out
+}
+
+// chunkCount is ceil(n/size) without the n+size-1 sum, which overflows for a size near MaxInt.
+func chunkCount(n, size int) int {
+	count := n / size
+	if n%size != 0 {
+		count++
+	}
+	return count
+}
+
+// attachClientStats fills each inbound's ClientStats in chunks: GORM's Preload binds one
+// variable per inbound, and nodes alone can report more inbounds than SQLite binds.
+func attachClientStats(db *gorm.DB, inbounds []*model.Inbound) error {
+	byID := make(map[int]*model.Inbound, len(inbounds))
+	ids := make([]int, 0, len(inbounds))
+	for _, ib := range inbounds {
+		byID[ib.Id] = ib
+		ids = append(ids, ib.Id)
+	}
+	for _, batch := range chunkInts(ids, sqliteMaxVars) {
+		var stats []xray.ClientTraffic
+		if err := db.Where("inbound_id IN ?", batch).Order("id ASC").Find(&stats).Error; err != nil {
+			return err
+		}
+		for _, st := range stats {
+			if ib := byID[st.InboundId]; ib != nil {
+				ib.ClientStats = append(ib.ClientStats, st)
+			}
+		}
+	}
+	return nil
+}
+
+// saveInChunks saves rows a slice at a time: one slice Save binds every column of every
+// row in a single statement, past SQLite's variable limit once there are enough rows.
+func saveInChunks[T any](tx *gorm.DB, rows []T) error {
+	const rowsPerStatement = 100
+	for start := 0; start < len(rows); start += rowsPerStatement {
+		if err := tx.Save(rows[start:min(start+rowsPerStatement, len(rows))]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }

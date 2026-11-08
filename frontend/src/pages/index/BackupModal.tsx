@@ -59,14 +59,10 @@ export default function BackupModal({
         return;
       }
 
+      // importDB schedules the panel restart server-side; wait it out, then reload.
       onBusy({ busy: true, tip: `${t('pages.settings.restartPanel')}…` });
-      const restart = await HttpUtil.post('/panel/api/setting/restartPanel');
-      if (restart?.success) {
-        await PromiseUtil.sleep(5000);
-        window.location.reload();
-      } else {
-        onBusy({ busy: false });
-      }
+      await PromiseUtil.sleep(5000);
+      window.location.reload();
     });
     fileInput.click();
   }
@@ -92,7 +88,7 @@ export default function BackupModal({
             type="primary"
             aria-label={t('pages.index.exportDatabase')}
             onClick={exportDb}
-            icon={<DownloadOutlined />}
+            icon={<DownloadOutlined aria-hidden />}
           />
         </div>
 
@@ -106,7 +102,7 @@ export default function BackupModal({
               type="primary"
               aria-label={t('pages.index.migrationDownload')}
               onClick={exportMigration}
-              icon={<DownloadOutlined />}
+              icon={<DownloadOutlined aria-hidden />}
             />
           </div>
         )}
@@ -124,7 +120,7 @@ export default function BackupModal({
             type="primary"
             aria-label={t('pages.index.importDatabase')}
             onClick={importDb}
-            icon={<UploadOutlined />}
+            icon={<UploadOutlined aria-hidden />}
           />
         </div>
 

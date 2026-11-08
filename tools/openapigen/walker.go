@@ -13,6 +13,7 @@ import (
 type walkOverride struct {
 	Field string
 	Kind  TypeKind
+	Type  TypeRef
 }
 
 type packageRequest struct {
@@ -60,6 +61,9 @@ func walkPackages(requests []packageRequest) ([]Schema, []Alias, error) {
 								s.Fields = append(s.Fields, buildFields(fld, overrides)...)
 							}
 							schemas = append(schemas, s)
+							continue
+						}
+						if _, ok := ts.Type.(*ast.InterfaceType); ok {
 							continue
 						}
 						if req.AliasAllow != nil && !req.AliasAllow[ts.Name.Name] {
@@ -119,7 +123,11 @@ func buildFields(fld *ast.Field, overrides []walkOverride) []Field {
 		t := exprToType(fld.Type)
 		for _, o := range overrides {
 			if o.Field == n.Name || o.Field == jsonName {
-				t = TypeRef{Kind: o.Kind}
+				if o.Type.Kind != "" {
+					t = o.Type
+				} else {
+					t = TypeRef{Kind: o.Kind}
+				}
 				break
 			}
 		}
@@ -142,7 +150,11 @@ func buildFields(fld *ast.Field, overrides []walkOverride) []Field {
 		t := exprToType(fld.Type)
 		for _, o := range overrides {
 			if o.Field == exprIdentName(fld.Type) || o.Field == jsonName {
-				t = TypeRef{Kind: o.Kind}
+				if o.Type.Kind != "" {
+					t = o.Type
+				} else {
+					t = TypeRef{Kind: o.Kind}
+				}
 				break
 			}
 		}

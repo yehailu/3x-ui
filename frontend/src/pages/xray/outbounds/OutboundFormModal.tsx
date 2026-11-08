@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Form, Input, InputNumber, Modal, Radio, Select, Space, Tabs, message } from 'antd';
 import { Controller, FormProvider, useForm, useWatch } from 'react-hook-form';
@@ -8,19 +8,21 @@ import { JsonEditor } from '@/components/form';
 import { Wireguard } from '@/utils';
 import { formValuesToWirePayload, rawOutboundToFormValues } from '@/lib/xray/outbound-form-adapter';
 import { parseOutboundLink } from '@/lib/xray/outbound-link-parser';
+import XDriveForm from '@/lib/xray/forms/transport/XDriveForm';
 import { XMUX_FRESH_DEFAULTS } from '@/schemas/protocols/stream/xhttp';
 import { OutboundFormBaseSchema, type OutboundFormValues } from '@/schemas/forms/outbound-form';
 import {
   canEnableReality,
   canEnableStream,
-  canEnableTls,
+  canEnableOutboundTls,
   canEnableTlsFlow,
 } from '@/lib/xray/protocol-capabilities';
 
 import {
   FLOW_OPTIONS,
   HYSTERIA_NETWORK_OPTION,
-  NETWORK_OPTIONS,
+  MASQUE_NETWORK_OPTION,
+  networkOptionsFor,
   PROTOCOL_OPTIONS,
   SERVER_PROTOCOLS,
   TARGET_STRATEGY_OPTIONS,
@@ -29,6 +31,7 @@ import {
   applyNetworkChange,
   buildAddModeValues,
   hysteriaStreamSlice,
+  masqueStreamSlice,
   newStreamSlice,
 } from './outbound-form-helpers';
 import {
@@ -37,6 +40,7 @@ import {
   FreedomFields,
   HttpFields,
   LoopbackFields,
+  MasqueFields,
   ServerTarget,
   ShadowsocksFields,
   SocksFields,
@@ -45,11 +49,13 @@ import {
   VmessFields,
   WireguardFields,
 } from './protocols';
+import { AmneziawgFields } from './protocols';
 import {
   GrpcForm,
   HttpUpgradeForm,
   HysteriaForm,
   KcpForm,
+  MasqueForm,
   MuxForm,
   RawForm,
   SockoptForm,
@@ -79,6 +85,7 @@ export default function OutboundFormModal({
   onConfirm,
 }: OutboundFormModalProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const [messageApi, messageContextHolder] = message.useMessage();
   const methods = useForm<OutboundFormValues>({ defaultValues: buildAddModeValues() });
   const [activeKey, setActiveKey] = useState('1');
@@ -98,16 +105,25 @@ export default function OutboundFormModal({
     '') as string;
   const security = (useWatch({ control: methods.control, name: 'streamSettings.security' }) ??
     'none') as string;
-  const flow = (useWatch({ control: methods.control, name: 'settings.flow' }) ?? '') as string;
+  const storedFlow = (useWatch({ control: methods.control, name: 'settings.flow' }) ??
+    '') as string;
+  const encryption = useWatch({ control: methods.control, name: 'settings.encryption' }) as
+    | string
+    | undefined;
   const reverseTag = useWatch({ control: methods.control, name: 'settings.reverseTag' });
   const wgSecretKey = useWatch({ control: methods.control, name: 'settings.secretKey' }) as
     | string
     | undefined;
 
   const streamAllowed = canEnableStream({ protocol });
-  const tlsAllowed = canEnableTls({ protocol, streamSettings: { network, security } });
+  const tlsAllowed = canEnableOutboundTls({ protocol, streamSettings: { network, security } });
   const realityAllowed = canEnableReality({ protocol, streamSettings: { network, security } });
-  const tlsFlowAllowed = canEnableTlsFlow({ protocol, streamSettings: { network, security } });
+  const tlsFlowAllowed = canEnableTlsFlow({
+    protocol,
+    settings: { encryption },
+    streamSettings: { network, security },
+  });
+  const flow = tlsFlowAllowed ? storedFlow : '';
 
   /*
    * Parse a share link (vmess:// / vless:// / trojan:// / ss:// /
@@ -161,6 +177,16 @@ export default function OutboundFormModal({
   }, [streamAllowed, network, protocol, methods]);
 
   useEffect(() => {
+    if (protocol !== 'masque') return;
+    if (network === 'masque' && security === 'tls') return;
+    const existing = (methods.getValues('streamSettings') ?? {}) as Record<string, unknown>;
+    const slice = masqueStreamSlice();
+    if (existing.masqueSettings) slice.masqueSettings = existing.masqueSettings;
+    if (existing.tlsSettings) slice.tlsSettings = existing.tlsSettings;
+    methods.setValue('streamSettings', slice as StreamValue);
+  }, [protocol, network, security, methods]);
+
+  useEffect(() => {
     if (protocol !== 'hysteria') return;
     if (network === 'hysteria' && security === 'tls') return;
     const existing = (methods.getValues('streamSettings') ?? {}) as Record<string, unknown>;
@@ -192,9 +218,12 @@ export default function OutboundFormModal({
       const nextProtocol = methods.getValues('protocol');
       const next = rawOutboundToFormValues({ protocol: nextProtocol });
       methods.setValue('settings', next.settings);
+      const currentNetwork = methods.getValues('streamSettings.network') ?? '';
       if (nextProtocol === 'hysteria') {
         methods.setValue('streamSettings', hysteriaStreamSlice() as StreamValue);
-      } else if ((methods.getValues('streamSettings.network') ?? '') === 'hysteria') {
+      } else if (nextProtocol === 'masque') {
+        methods.setValue('streamSettings', masqueStreamSlice() as StreamValue);
+      } else if (currentNetwork === 'hysteria' || currentNetwork === 'masque') {
         methods.setValue('streamSettings', {
           ...newStreamSlice('tcp'),
           security: 'none',
@@ -237,9 +266,11 @@ export default function OutboundFormModal({
    * wsSettings, etc.) so the DU branch matches. Preserve security if
    * the new network supports it, otherwise force back to 'none'.
    */
+  // xray-core 26.10.17 (#7182) dials XDRIVE only through Mux, so picking XDRIVE turns Mux on.
   function onNetworkChange(next: string) {
     const stream = (methods.getValues('streamSettings') ?? {}) as Record<string, unknown>;
     methods.setValue('streamSettings', applyNetworkChange(protocol, stream, next) as StreamValue);
+    if (next === 'xdrive') methods.setValue('mux.enabled', true);
   }
 
   function onXmuxToggle(checked: boolean) {
@@ -389,6 +420,7 @@ export default function OutboundFormModal({
                           return (
                             <Form.Item
                               label={t('pages.xray.outbound.tag')}
+                              htmlFor={`${uid}-tag`}
                               required
                               validateStatus={
                                 errorMessage ? 'error' : duplicateTag ? 'warning' : undefined
@@ -401,6 +433,7 @@ export default function OutboundFormModal({
                               }
                             >
                               <Input
+                                id={`${uid}-tag`}
                                 value={field.value}
                                 onChange={(e) => field.onChange(e.target.value)}
                                 onBlur={field.onBlur}
@@ -416,13 +449,17 @@ export default function OutboundFormModal({
                         <Input placeholder={t('pages.xray.outboundForm.localIpPlaceholder')} />
                       </FormField>
 
-                      <FormField
-                        label={t('pages.xray.outbound.targetStrategy')}
-                        name="targetStrategy"
-                        tooltip={t('pages.xray.outboundForm.targetStrategyHint')}
-                      >
-                        <Select allowClear placeholder="AsIs" options={TARGET_STRATEGY_OPTIONS} />
-                      </FormField>
+                      {/* Freedom's own card owns the strategy — the core migrates this
+                          root key into the same sockopt value, so two knobs would race. */}
+                      {protocol !== 'freedom' && (
+                        <FormField
+                          label={t('pages.xray.outbound.targetStrategy')}
+                          name="targetStrategy"
+                          tooltip={t('pages.xray.outboundForm.targetStrategyHint')}
+                        >
+                          <Select allowClear placeholder="AsIs" options={TARGET_STRATEGY_OPTIONS} />
+                        </FormField>
+                      )}
 
                       {SERVER_PROTOCOLS.has(protocol) && <ServerTarget />}
                       {protocol === 'vmess' && <VmessFields />}
@@ -431,6 +468,7 @@ export default function OutboundFormModal({
                       {protocol === 'shadowsocks' && <ShadowsocksFields />}
                       {protocol === 'http' && <HttpFields />}
                       {protocol === 'socks' && <SocksFields />}
+                      {protocol === 'masque' && <MasqueFields />}
 
                       {protocol === 'loopback' && <LoopbackFields />}
                       {protocol === 'blackhole' && <BlackholeFields />}
@@ -453,17 +491,21 @@ export default function OutboundFormModal({
                       )}
 
                       {protocol === 'wireguard' && <WireguardFields />}
+                      {protocol === 'amneziawg' && <AmneziawgFields />}
 
                       {streamAllowed && network && (
                         <>
-                          <Form.Item label={t('transmission')}>
+                          <Form.Item label={t('transmission')} htmlFor={`${uid}-network`}>
                             <Select
+                              id={`${uid}-network`}
                               value={network}
                               onChange={onNetworkChange}
                               options={
                                 protocol === 'hysteria'
                                   ? [HYSTERIA_NETWORK_OPTION]
-                                  : NETWORK_OPTIONS
+                                  : protocol === 'masque'
+                                    ? [MASQUE_NETWORK_OPTION]
+                                    : networkOptionsFor(protocol)
                               }
                             />
                           </Form.Item>
@@ -481,6 +523,10 @@ export default function OutboundFormModal({
                           {network === 'xhttp' && <XhttpForm onXmuxToggle={onXmuxToggle} />}
 
                           {network === 'hysteria' && <HysteriaForm />}
+
+                          {network === 'xdrive' && <XDriveForm />}
+
+                          {network === 'masque' && <MasqueForm />}
                         </>
                       )}
 
@@ -496,7 +542,7 @@ export default function OutboundFormModal({
 
                       {/* Vision seed knobs only meaningful for the exact
                           xtls-rprx-vision flow, on TCP+(tls|reality). */}
-                      {tlsFlowAllowed && flow === 'xtls-rprx-vision' && (
+                      {flow === 'xtls-rprx-vision' && (
                         <>
                           <FormField
                             label={t('pages.xray.outboundForm.visionTestpre')}
@@ -508,7 +554,11 @@ export default function OutboundFormModal({
                             <Space.Compact block>
                               {[0, 1, 2, 3].map((i) => (
                                 <FormField key={i} name={['settings', 'testseed', i]} noStyle>
-                                  <InputNumber min={1} style={{ width: '25%' }} />
+                                  <InputNumber
+                                    aria-label={`${t('pages.inbounds.form.visionTestseed')} ${i + 1}`}
+                                    min={1}
+                                    style={{ width: '25%' }}
+                                  />
                                 </FormField>
                               ))}
                             </Space.Compact>
@@ -523,7 +573,7 @@ export default function OutboundFormModal({
                             buttonStyle="solid"
                             onChange={(e) => onSecurityChange(e.target.value as string)}
                           >
-                            {network !== 'hysteria' && (
+                            {network !== 'hysteria' && network !== 'masque' && (
                               <Radio.Button value="none">{t('none')}</Radio.Button>
                             )}
                             {tlsAllowed && <Radio.Button value="tls">TLS</Radio.Button>}
@@ -539,7 +589,10 @@ export default function OutboundFormModal({
                       {((streamAllowed && network) ||
                         !streamAllowed ||
                         protocol === 'wireguard') && (
-                        <SockoptForm outboundTags={dialerProxyTags ?? existingTags} />
+                        <SockoptForm
+                          outboundTags={dialerProxyTags ?? existingTags}
+                          showDomainStrategy={protocol !== 'freedom'}
+                        />
                       )}
 
                       <Controller
@@ -556,7 +609,7 @@ export default function OutboundFormModal({
                         )}
                       />
 
-                      <MuxForm protocol={protocol} network={network} />
+                      <MuxForm protocol={protocol} network={network} flow={flow} />
                     </>
                   ),
                 },
@@ -570,6 +623,7 @@ export default function OutboundFormModal({
                       style={{ width: '100%', marginTop: 10 }}
                     >
                       <Input.Search
+                        aria-label={t('pages.clients.link')}
                         value={linkInput}
                         placeholder="vmess:// vless:// trojan:// ss:// hysteria2:// wireguard://"
                         enterButton="Import"

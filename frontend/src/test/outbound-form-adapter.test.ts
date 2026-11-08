@@ -58,6 +58,7 @@ describe('outbound-form-adapter: round-trip', () => {
         flow: 'xtls-rprx-vision',
         encryption: 'none',
       },
+      streamSettings: { network: 'tcp', security: 'reality' },
     };
     const form = rawOutboundToFormValues(wire);
     expect(form.protocol).toBe('vless');
@@ -117,6 +118,64 @@ describe('outbound-form-adapter: round-trip', () => {
     const back = formValuesToWirePayload(form);
     const settings = back.settings as Record<string, unknown>;
     expect(settings.reverse).toMatchObject({ tag: 'rev-1' });
+  });
+
+  // The flow select hides off TCP+TLS/REALITY but keeps its value; xray then fails every dial.
+  it('vless drops a Vision flow its transport cannot carry, and lets mux back on', () => {
+    const outbound = (streamSettings: Record<string, unknown>) =>
+      formValuesToWirePayload(
+        rawOutboundToFormValues({
+          protocol: 'vless',
+          settings: {
+            address: 'srv',
+            port: 443,
+            id: '11111111-2222-4333-8444-555555555555',
+            flow: 'xtls-rprx-vision',
+            encryption: 'none',
+            testpre: 5,
+          },
+          streamSettings,
+          mux: { enabled: true, concurrency: 8 },
+        }),
+      );
+
+    const xdrive = outbound({
+      network: 'xdrive',
+      security: 'none',
+      xdriveSettings: { service: 'local', remoteFolder: '/tmp/shared' },
+    });
+    expect(xdrive.settings).toMatchObject({ flow: '' });
+    expect(xdrive.settings).not.toHaveProperty('testpre');
+    expect(xdrive.mux).toMatchObject({ enabled: true });
+
+    const ws = outbound({ network: 'ws', security: 'tls', wsSettings: { path: '/' } });
+    expect(ws.settings).toMatchObject({ flow: '' });
+
+    const reality = outbound({
+      network: 'tcp',
+      security: 'reality',
+      realitySettings: { serverName: 'a.example', publicKey: 'k', fingerprint: 'chrome' },
+    });
+    expect(reality.settings).toMatchObject({ flow: 'xtls-rprx-vision', testpre: 5 });
+    expect(reality).not.toHaveProperty('mux');
+  });
+
+  // VLESS encryption carries Vision on any transport; stripping it gets the server's "client flow is empty".
+  it('vless keeps a Vision flow over VLESS encryption on RAW without TLS', () => {
+    const wire = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'vless',
+        settings: {
+          address: 'srv',
+          port: 443,
+          id: '11111111-2222-4333-8444-555555555555',
+          flow: 'xtls-rprx-vision',
+          encryption: 'mlkem768x25519plus.native.0rtt.cbEXq-_hfkxDUex6HqmSaemEELvnFWc8qQ1MxlNDHnE',
+        },
+        streamSettings: { network: 'tcp', security: 'none' },
+      }),
+    );
+    expect(wire.settings).toMatchObject({ flow: 'xtls-rprx-vision' });
   });
 
   it('vless does not emit testpre/testseed unless flow is vision', () => {
@@ -264,6 +323,122 @@ describe('outbound-form-adapter: round-trip', () => {
     expect(withType.settings).toEqual({ response: { type: 'http' } });
   });
 
+  it('blackhole carries customResponseData only for the custom response type', () => {
+    const custom = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'blackhole',
+        settings: { response: { type: 'custom', customResponseData: 'SFRUUC8xLjEgNDAz' } },
+      }),
+    );
+    expect(custom.settings).toEqual({
+      response: { type: 'custom', customResponseData: 'SFRUUC8xLjEgNDAz' },
+    });
+
+    const http = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'blackhole',
+        settings: { response: { type: 'http', customResponseData: 'ignored' } },
+      }),
+    );
+    expect(http.settings).toEqual({ response: { type: 'http' } });
+  });
+
+  it('wireguard csv-joins remoteDNS on read and splits it on write', () => {
+    const wire = {
+      protocol: 'wireguard',
+      settings: {
+        secretKey: 'YFVmTVCBsLxXJCe4i+jK8PgD3S6vUqfZ4Zl0JVNDfHA=',
+        remoteDNS: ['1.1.1.1', '2606:4700:4700::1111'],
+        peers: [{ publicKey: 'pk', endpoint: 'wg.example.com:51820' }],
+      },
+    };
+    const form = rawOutboundToFormValues(wire);
+    if (form.protocol === 'wireguard') {
+      expect(form.settings.remoteDNS).toBe('1.1.1.1,2606:4700:4700::1111');
+    }
+    const back = formValuesToWirePayload(form);
+    expect((back.settings as { remoteDNS?: string[] }).remoteDNS).toEqual([
+      '1.1.1.1',
+      '2606:4700:4700::1111',
+    ]);
+
+    const unset = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        settings: { secretKey: wire.settings.secretKey, peers: wire.settings.peers },
+      }),
+    );
+    expect((unset.settings as { remoteDNS?: string[] }).remoteDNS).toBeUndefined();
+  });
+
+  // xray-core 26.9.30 ignores wireguard's settings.domainStrategy and panics on remoteDNS
+  // "local"; the endpoint lookup reads sockopt.domainStrategy, in-tunnel targets targetStrategy.
+  it('wireguard lifts the removed domainStrategy and remoteDNS local where the core reads them', () => {
+    const settings = {
+      secretKey: 'YFVmTVCBsLxXJCe4i+jK8PgD3S6vUqfZ4Zl0JVNDfHA=',
+      peers: [{ publicKey: 'pk', endpoint: 'engage.cloudflareclient.com:2408' }],
+    };
+    const warp = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        settings: { ...settings, domainStrategy: 'ForceIPv4v6' },
+      }),
+    );
+    expect(warp.targetStrategy).toBe('ForceIPv4v6');
+    expect(warp.streamSettings).toEqual({ sockopt: { domainStrategy: 'ForceIPv4v6' } });
+    expect((warp.settings as Record<string, unknown>).domainStrategy).toBeUndefined();
+
+    const local = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        settings: { ...settings, remoteDNS: ['local'] },
+      }),
+    );
+    expect(local.targetStrategy).toBe('ForceIP');
+    expect((local.settings as Record<string, unknown>).remoteDNS).toBeUndefined();
+
+    const admin = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        targetStrategy: 'UseIPv6',
+        streamSettings: { sockopt: { domainStrategy: 'UseIPv4' } },
+        settings: { ...settings, domainStrategy: 'ForceIPv6' },
+      }),
+    );
+    expect(admin.targetStrategy).toBe('UseIPv6');
+    expect(admin.streamSettings).toEqual({ sockopt: { domainStrategy: 'UseIPv4' } });
+  });
+
+  // The core dials a wireguard peer through its finalmask (noise "exp" was built for WARP),
+  // so saving through the form must keep the masks next to sockopt instead of dropping them.
+  it('wireguard keeps its finalmask on save and drops an empty one', () => {
+    const settings = {
+      secretKey: 'YFVmTVCBsLxXJCe4i+jK8PgD3S6vUqfZ4Zl0JVNDfHA=',
+      peers: [{ publicKey: 'pk', endpoint: 'engage.cloudflareclient.com:2408' }],
+    };
+    const noise = {
+      type: 'noise',
+      settings: { noise: [{ type: 'exp', packet: '<b 0d0a0d0a><t>', delay: '1-3' }] },
+    };
+    const masked = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        settings,
+        streamSettings: { sockopt: { mark: 255 }, finalmask: { tcp: [], udp: [noise] } },
+      }),
+    );
+    expect(masked.streamSettings).toEqual({ sockopt: { mark: 255 }, finalmask: { udp: [noise] } });
+
+    const empty = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'wireguard',
+        settings,
+        streamSettings: { sockopt: { mark: 255 }, finalmask: { tcp: [], udp: [] } },
+      }),
+    );
+    expect(empty.streamSettings).toEqual({ sockopt: { mark: 255 } });
+  });
+
   it('dns rules normalize qType numeric strings, split domains, carry rCode', () => {
     const wire = {
       protocol: 'dns',
@@ -286,6 +461,19 @@ describe('outbound-form-adapter: round-trip', () => {
       domain: ['example.com', 'ext.org'],
     });
     expect(rules[1]).toEqual({ action: 'return', qType: 28, domain: ['blocked.com'], rCode: 3 });
+  });
+
+  it('dns rules keep qType 0 a string, since the core reads a numeric 0 as every query', () => {
+    const back = formValuesToWirePayload(
+      rawOutboundToFormValues({
+        protocol: 'dns',
+        settings: { rules: [{ action: 'drop', qType: 0 }] },
+      }),
+    );
+    const rules = (back.settings as Record<string, unknown>).rules as Array<
+      Record<string, unknown>
+    >;
+    expect(rules[0]).toEqual({ action: 'drop', qType: '0' });
   });
 
   it('dns rules read the legacy qtype wire key for back-compat', () => {
@@ -328,8 +516,9 @@ describe('outbound-form-adapter: round-trip', () => {
         },
       }),
     );
+    // The strategy no longer rides in settings; see freedom-strategy-placement.test.ts.
+    expect(filled.streamSettings).toEqual({ sockopt: { domainStrategy: 'UseIPv4' } });
     expect(filled.settings).toMatchObject({
-      domainStrategy: 'UseIPv4',
       redirect: '1.1.1.1',
       userLevel: 3,
       proxyProtocol: 2,
@@ -413,6 +602,7 @@ describe('outbound-form-adapter: round-trip', () => {
           flow: 'xtls-rprx-vision',
           encryption: 'none',
         },
+        streamSettings: { network: 'tcp', security: 'reality' },
         mux: { enabled: true },
       }),
     );
@@ -486,6 +676,32 @@ describe('outbound-form-adapter: round-trip', () => {
     const form = rawOutboundToFormValues({ protocol: 'mysterious', settings: {} });
     expect(form.protocol).toBe('vless');
   });
+
+  it('reads a protocol id the way the core does, whatever its case', () => {
+    const freedom = rawOutboundToFormValues({
+      protocol: 'Freedom',
+      tag: 'direct',
+      settings: { redirect: '1.1.1.1' },
+      streamSettings: { sockopt: { domainStrategy: 'UseIPv4' } },
+    });
+    expect(freedom.protocol).toBe('freedom');
+    if (freedom.protocol === 'freedom') {
+      expect(freedom.settings.redirect).toBe('1.1.1.1');
+    }
+    const back = formValuesToWirePayload(freedom);
+    expect(back.protocol).toBe('freedom');
+    expect(back.tag).toBe('direct');
+    expect((back.settings as Record<string, unknown>).redirect).toBe('1.1.1.1');
+
+    const vless = rawOutboundToFormValues({
+      protocol: 'VLESS',
+      settings: { address: 'srv', port: 443, id: '11111111-2222-4333-8444-555555555555' },
+    });
+    expect(vless.protocol).toBe('vless');
+    if (vless.protocol === 'vless') {
+      expect(vless.settings.address).toBe('srv');
+    }
+  });
 });
 
 describe('outbound-form-adapter: targetStrategy', () => {
@@ -508,7 +724,7 @@ describe('outbound-form-adapter: targetStrategy', () => {
 
   it('normalizes wire case to the canonical spelling (core matches case-insensitively)', () => {
     const form = rawOutboundToFormValues({
-      protocol: 'freedom',
+      protocol: 'vless',
       settings: {},
       targetStrategy: 'useipv4v6',
     });
@@ -534,7 +750,7 @@ describe('outbound-form-adapter: targetStrategy', () => {
     expect(invalid).not.toHaveProperty('targetStrategy');
   });
 
-  it('freedom prefers settings.targetStrategy over domainStrategy and emits the legacy key', () => {
+  it('freedom prefers settings.targetStrategy over domainStrategy and moves it to sockopt', () => {
     const form = rawOutboundToFormValues({
       protocol: 'freedom',
       settings: { targetStrategy: 'UseIPv6', domainStrategy: 'UseIPv4' },
@@ -543,8 +759,11 @@ describe('outbound-form-adapter: targetStrategy', () => {
       expect(form.settings.domainStrategy).toBe('UseIPv6');
     }
     const back = formValuesToWirePayload(form);
-    expect(back.settings).toMatchObject({ domainStrategy: 'UseIPv6' });
+    // Neither legacy key may survive: the core warns about both, and sockopt is
+    // the only placement freedom resolves with.
+    expect(back.settings).not.toHaveProperty('domainStrategy');
     expect(back.settings).not.toHaveProperty('targetStrategy');
+    expect(back.streamSettings).toEqual({ sockopt: { domainStrategy: 'UseIPv6' } });
   });
 });
 

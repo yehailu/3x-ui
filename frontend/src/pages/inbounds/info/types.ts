@@ -1,4 +1,5 @@
 import type { SubSettings } from '../useInbounds';
+import type { HostRecord } from '@/schemas/api/host';
 
 export interface ClientStats {
   email: string;
@@ -35,7 +36,6 @@ export interface InboundInfo {
   isHttpupgrade: boolean;
   isXHTTP: boolean;
   isGrpc: boolean;
-  isSSMultiUser: boolean;
   isSS2022: boolean;
   isVlessTlsFlow: boolean;
   host: string | null;
@@ -82,5 +82,6 @@ export interface InboundInfoModalProps {
   tgBotEnable?: boolean;
   nodeAddress?: string;
   subSettings?: SubSettings;
+  hosts?: HostRecord[];
   lastOnlineMap?: Record<string, number>;
 }

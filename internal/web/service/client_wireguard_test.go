@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 )
@@ -24,6 +25,9 @@ func TestAllocateWireguardAddress(t *testing.T) {
 		{name: "default base when empty", used: nil, base: "", want: "10.0.0.2/32"},
 		{name: "full ipv4 scope widens instead of failing", used: []string{"10.9.0.2/32", "10.9.0.3/32"}, base: "10.9.0.0/30", want: "10.9.0.4/32"},
 		{name: "exhausted ipv6 scope errors", used: []string{"fd00::2/128", "fd00::3/128"}, base: "fd00::/126", err: true},
+		// A node can report a wide claim; the scan must step over it, not through 2^64 addresses.
+		{name: "wide claim over an ipv6 scope", used: []string{"fd00::/64"}, base: "fd00::/64", err: true},
+		{name: "first address past a wide claim", used: []string{"10.0.0.0/25"}, base: "10.0.0.0/24", want: "10.0.0.128/32"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -360,5 +364,119 @@ func TestDefaultWireguardClientsFallsBackWhenNoExplicitSubnet(t *testing.T) {
 	}
 	if got := clients[0].AllowedIPs[0]; got != "172.16.0.3/32" {
 		t.Fatalf("with no explicit subnet, inference from existing clients must still apply; got %v", got)
+	}
+}
+
+// xray credits a packet to the first peer whose allowedIPs contain its source,
+// so a prefix covering another client's address steals that client's traffic.
+func TestDefaultWireguardClientsRejectsOverlappingAllowedIPs(t *testing.T) {
+	existing := []model.Client{{Email: "a@wg", AllowedIPs: []string{"10.10.2.9/24"}}}
+	clients := []model.Client{{Email: "b@wg", AllowedIPs: []string{"10.10.2.52/24"}}}
+	err := defaultWireguardClients("", existing, clients, []any{map[string]any{"email": "b@wg"}}, nil)
+	if err == nil || !strings.Contains(err.Error(), "10.10.2.52/24") || !strings.Contains(err.Error(), "10.10.2.9/24") {
+		t.Fatalf("overlapping allowedIPs must be rejected naming both entries, got: %v", err)
+	}
+
+	crossUsed := map[string]string{"10.8.1.0/24": "inbound 'awg' (#10)"}
+	inside := []model.Client{{Email: "c@wg", AllowedIPs: []string{"10.8.1.21/32"}}}
+	err = defaultWireguardClients("", nil, inside, []any{map[string]any{"email": "c@wg"}}, crossUsed)
+	if err == nil || !strings.Contains(err.Error(), "inbound 'awg' (#10)") {
+		t.Fatalf("an address inside another inbound's prefix must be rejected naming that inbound, got: %v", err)
+	}
+}
+
+func TestAllocateWireguardAddressSkipsAddressesInsideUsedPrefixes(t *testing.T) {
+	got, err := allocateWireguardAddress([]string{"10.0.0.2/31"}, "10.0.0.0/24", true)
+	if err != nil {
+		t.Fatalf("allocateWireguardAddress: %v", err)
+	}
+	if got != "10.0.0.4/32" {
+		t.Fatalf("got %s, want 10.0.0.4/32: .2 and .3 are both inside the used 10.0.0.2/31", got)
+	}
+}
+
+// A /0 that is being written contains every other peer's address, and its host bits
+// are read back as the peer's own tunnel address (amneziawg.FirstIPv4). Only a stored
+// 0.0.0.0/0 or ::/0 keeps nobody out, as legacy peers carry it.
+func TestWireguardSlashZeroIsSubjectToTheOverlapGuard(t *testing.T) {
+	for _, tt := range []struct {
+		entry, used string
+		taken       bool
+	}{
+		{"10.8.1.2/0", "10.8.1.2/32", true},
+		{"10.8.1.3/0", "10.8.1.2/32", true},
+		{"0.0.0.0/0", "10.8.1.2/32", true},
+		{"::/0", "fd00::2/128", true},
+		{"fd00::2/0", "fd00::2/128", true},
+		{"::/0", "10.8.1.2/32", false},
+		{"10.8.1.2/32", "10.8.1.2/0", true},
+		{"fd00::2/128", "fd00::2/0", true},
+		{"10.8.1.2/32", "10.8.1.3/0", false},
+		{"10.8.1.2/32", "0.0.0.0/0", false},
+		{"0.0.0.0/0", "0.0.0.0/0", false},
+	} {
+		t.Run(tt.entry+" next to "+tt.used, func(t *testing.T) {
+			if _, taken := wireguardAllowedIPsOverlap([]string{tt.entry}, []string{tt.used}); (taken != "") != tt.taken {
+				t.Errorf("taken = %q, want a collision: %v", taken, tt.taken)
+			}
+		})
+	}
+
+	existing := []model.Client{{Email: "victim@wg", AllowedIPs: []string{"10.0.0.2/32"}}}
+	awgSettings := `{"server":{"subnetIp":"10.0.0.0","subnetCidr":24}}`
+	for _, entry := range []string{"10.0.0.2/0", "0.0.0.0/0"} {
+		clients := []model.Client{{Email: "other@wg", AllowedIPs: []string{entry}}}
+		err := defaultWireguardClients("", existing, clients, []any{map[string]any{}}, nil)
+		if err == nil || !strings.Contains(err.Error(), entry+" overlaps 10.0.0.2/32") {
+			t.Errorf("wireguard: %s next to 10.0.0.2/32: err = %v, want an overlap", entry, err)
+		}
+		err = defaultAmneziaWGClients(awgSettings, existing, clients, []any{map[string]any{}}, nil)
+		if err == nil || !strings.Contains(err.Error(), entry+" overlaps 10.0.0.2/32") {
+			t.Errorf("amneziawg: %s next to 10.0.0.2/32: err = %v, want an overlap", entry, err)
+		}
+	}
+
+	got, err := allocateWireguardAddress([]string{"10.0.0.2/0"}, "10.0.0.0/24", true)
+	if err != nil || got != "10.0.0.3/32" {
+		t.Errorf("allocated %q (%v) next to a stored 10.0.0.2/0, want 10.0.0.3/32", got, err)
+	}
+}
+
+// The edit form echoes what the client holds, so a legacy peer's default route has
+// to survive a save next to other clients; no edit may bring in a new one.
+func TestUpdateInboundClientKeepsButNeverAddsDefaultRoute(t *testing.T) {
+	setupConflictDB(t)
+	seedInboundConflict(t, "own-wg", "0.0.0.0", 51830, model.WireGuard, ``, `{"clients":[`+
+		`{"email":"legacy","subId":"s-legacy","enable":true,"publicKey":"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=","allowedIPs":["0.0.0.0/0","::/0"]},`+
+		`{"email":"victim","subId":"s-victim","enable":true,"publicKey":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=","allowedIPs":["10.0.0.2/32"]},`+
+		`{"email":"other","subId":"s-other","enable":true,"publicKey":"Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M=","allowedIPs":["10.0.0.3/32"]}]}`)
+	s, inboundSvc := &ClientService{}, &InboundService{}
+	var own model.Inbound
+	if err := database.GetDB().Where("tag = ?", "own-wg").First(&own).Error; err != nil {
+		t.Fatalf("read seeded row: %v", err)
+	}
+	clients, err := inboundSvc.GetClients(&own)
+	if err != nil {
+		t.Fatalf("GetClients: %v", err)
+	}
+	if err := s.SyncInbound(nil, own.Id, clients); err != nil {
+		t.Fatalf("SyncInbound: %v", err)
+	}
+	save := func(email, allowedIPs string) error {
+		data := &model.Inbound{Id: own.Id, Settings: `{"clients":[{"email":"` + email + `","subId":"s-` + email + `","enable":true,"allowedIPs":` + allowedIPs + `}]}`}
+		_, err := s.UpdateInboundClient(inboundSvc, data, email)
+		return err
+	}
+
+	if err := save("legacy", `["0.0.0.0/0","::/0"]`); err != nil {
+		t.Errorf("saving the legacy peer as it is: %v", err)
+	}
+	for _, allowedIPs := range []string{`["0.0.0.0/0"]`, `["10.0.0.2/0"]`, `["10.0.0.3/32","0.0.0.0/0"]`} {
+		if err := save("other", allowedIPs); err == nil || !strings.Contains(err.Error(), "overlaps 10.0.0.2/32") {
+			t.Errorf("other saved with %s: err = %v, want an overlap with 10.0.0.2/32", allowedIPs, err)
+		}
+	}
+	if err := save("legacy", `["10.0.0.2/0","::/0"]`); err == nil || !strings.Contains(err.Error(), "10.0.0.2/0 overlaps 10.0.0.2/32") {
+		t.Errorf("the legacy peer took 10.0.0.2/0 next to 10.0.0.2/32: err = %v", err)
 	}
 }

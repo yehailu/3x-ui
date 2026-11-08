@@ -127,15 +127,24 @@ function StatusLabel({ status, xrayState }: HealthProps) {
       </span>
     );
   }
-  return <span>{t(`pages.nodes.statusValues.${status || 'unknown'}`)}</span>;
+  // A sub-node's status is free text from its parent node: show it as unknown, not as a key.
+  return (
+    <span>
+      {t(`pages.nodes.statusValues.${status || 'unknown'}`, {
+        defaultValue: t('pages.nodes.statusValues.unknown'),
+      })}
+    </span>
+  );
 }
 
-function formatPct(p?: number): string {
+function formatPct(p?: number, available = true): string {
+  if (!available) return '—';
   if (typeof p !== 'number' || Number.isNaN(p)) return '-';
   return `${p.toFixed(1)}%`;
 }
 
-function formatUptime(secs?: number): string {
+function formatUptime(secs?: number, available = true): string {
+  if (!available) return '—';
   if (!secs) return '-';
   const days = Math.floor(secs / 86400);
   const hours = Math.floor((secs % 86400) / 3600);
@@ -145,17 +154,22 @@ function formatUptime(secs?: number): string {
   return `${mins}m`;
 }
 
+// Stable per language: the columns memo depends on it, and a fresh function each
+// render rebuilt every column, re-rendering all rows on each heartbeat push.
 function useRelativeTime() {
   const { t } = useTranslation();
-  return (unixSeconds?: number) => {
-    if (!unixSeconds) return t('pages.nodes.never');
-    const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
-    if (diffSec < 5) return t('pages.nodes.justNow');
-    if (diffSec < 60) return `${diffSec}s`;
-    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
-    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
-    return `${Math.floor(diffSec / 86400)}d`;
-  };
+  return useMemo(
+    () => (unixSeconds?: number) => {
+      if (!unixSeconds) return t('pages.nodes.never');
+      const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - unixSeconds));
+      if (diffSec < 5) return t('pages.nodes.justNow');
+      if (diffSec < 60) return `${diffSec}s`;
+      if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+      if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+      return `${Math.floor(diffSec / 86400)}d`;
+    },
+    [t],
+  );
 }
 
 export default function NodeList({
@@ -181,11 +195,11 @@ export default function NodeList({
   const [statsNode, setStatsNode] = useState<NodeRow | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
-  // Map a node GUID to its display name so a transitive sub-node can show which
-  // parent it is reached through (#4983).
+  // Map a direct node's GUID to its display name so a transitive sub-node can show
+  // which parent it is reached through (#4983); the master walks one level only.
   const nameByGuid = useMemo(() => {
     const m = new Map<string, string>();
-    for (const n of nodes) if (n.guid) m.set(n.guid, n.name || n.guid);
+    for (const n of nodes) if (n.guid && !n.transitive) m.set(n.guid, n.name || n.guid);
     return m;
   }, [nodes]);
 
@@ -247,7 +261,7 @@ export default function NodeList({
                 parent: record.parentGuid ? nameByGuid.get(record.parentGuid) || '-' : '-',
               })}
             >
-              <Tag icon={<ApartmentOutlined />} style={{ margin: 0 }}>
+              <Tag icon={<ApartmentOutlined aria-hidden />} style={{ margin: 0 }}>
                 {t('pages.nodes.subNode')}
               </Tag>
             </Tooltip>
@@ -258,7 +272,7 @@ export default function NodeList({
                   type="text"
                   size="small"
                   style={{ fontSize: 16 }}
-                  icon={<ThunderboltOutlined />}
+                  icon={<ThunderboltOutlined aria-hidden />}
                   aria-label={t('pages.nodes.probe')}
                   onClick={() => onProbe(record)}
                 />
@@ -269,7 +283,7 @@ export default function NodeList({
                     type="text"
                     size="small"
                     style={{ fontSize: 16 }}
-                    icon={<CloudDownloadOutlined />}
+                    icon={<CloudDownloadOutlined aria-hidden />}
                     aria-label={t('pages.nodes.updatePanel')}
                     onClick={() => onUpdateNode(record)}
                   />
@@ -280,7 +294,7 @@ export default function NodeList({
                   type="text"
                   size="small"
                   style={{ fontSize: 16 }}
-                  icon={<EditOutlined />}
+                  icon={<EditOutlined aria-hidden />}
                   aria-label={t('edit')}
                   onClick={() => onEdit(record)}
                 />
@@ -291,7 +305,7 @@ export default function NodeList({
                   size="small"
                   danger
                   style={{ fontSize: 16 }}
-                  icon={<DeleteOutlined />}
+                  icon={<DeleteOutlined aria-hidden />}
                   aria-label={t('delete')}
                   onClick={() => onDelete(record)}
                 />
@@ -311,6 +325,7 @@ export default function NodeList({
             <Switch
               checked={!!record.enable}
               size="small"
+              aria-label={t('pages.nodes.enable')}
               onChange={(v) => onToggleEnable(record, v)}
             />
           ),
@@ -326,7 +341,7 @@ export default function NodeList({
           >
             <span className="name">
               {record.transitive && (
-                <ApartmentOutlined style={{ marginInlineEnd: 6, opacity: 0.6 }} />
+                <ApartmentOutlined aria-hidden style={{ marginInlineEnd: 6, opacity: 0.6 }} />
               )}
               {record.name}
             </span>
@@ -386,7 +401,7 @@ export default function NodeList({
               <StatusLabel status={record.status} xrayState={record.xrayState} />
               {tip && (
                 <Tooltip title={tip}>
-                  <ExclamationCircleOutlined style={{ color: iconColor }} />
+                  <ExclamationCircleOutlined style={{ color: iconColor }} aria-label={tip} />
                 </Tooltip>
               )}
             </Space>
@@ -398,7 +413,8 @@ export default function NodeList({
         dataIndex: 'cpuPct',
         align: 'center',
         width: 90,
-        render: (_value, record) => formatPct(record.cpuPct),
+        render: (_value, record) =>
+          formatPct(record.cpuPct, !record.unavailableMetrics?.includes('cpu')),
       },
       {
         title: t('pages.nodes.mem'),
@@ -446,7 +462,8 @@ export default function NodeList({
         title: t('pages.nodes.uptime'),
         dataIndex: 'uptimeSecs',
         align: 'center',
-        render: (_value, record) => formatUptime(record.uptimeSecs),
+        render: (_value, record) =>
+          formatUptime(record.uptimeSecs, !record.unavailableMetrics?.includes('uptime')),
       },
       {
         title: t('clients'),
@@ -455,7 +472,7 @@ export default function NodeList({
         render: (_value, record) => (
           <Space size={2}>
             <Tag className="client-count-tag" style={{ margin: 0, padding: '0 2px' }}>
-              <TeamOutlined /> {record.clientCount || 0}
+              <TeamOutlined aria-hidden /> {record.clientCount || 0}
             </Tag>
             {record.activeCount ? (
               <Tooltip title={t('subscription.active')}>
@@ -530,17 +547,58 @@ export default function NodeList({
     ],
   );
 
+  // rc-table re-runs every cell renderer whenever the Table re-renders, so keep the
+  // same element until its inputs change rather than re-rendering all rows each time.
+  const nodeTable = useMemo(
+    () => (
+      <Table<NodeRow>
+        dataSource={dataSource}
+        columns={columns}
+        pagination={false}
+        loading={loading}
+        scroll={{ x: 'max-content' }}
+        size="middle"
+        rowKey="key"
+        rowSelection={
+          dataSource.length > 1
+            ? {
+                selectedRowKeys: selectedIds,
+                onChange: (keys) =>
+                  onSelectionChange(keys.filter((k) => typeof k === 'number') as number[]),
+                getCheckboxProps: (record) => ({
+                  disabled: !!record.transitive || !isUpdateEligible(record),
+                }),
+              }
+            : undefined
+        }
+        locale={{
+          emptyText: (
+            <div className="card-empty">
+              <ClusterOutlined aria-hidden style={{ fontSize: 32, marginBottom: 8 }} />
+              <div>{t('noData')}</div>
+            </div>
+          ),
+        }}
+        expandable={{
+          expandedRowRender: (record) => <NodeHistoryPanel node={record} />,
+          rowExpandable: (record) => !record.transitive,
+        }}
+      />
+    ),
+    [dataSource, columns, loading, selectedIds, onSelectionChange, t],
+  );
+
   return (
     <Card size="small" hoverable>
       <div className="toolbar">
-        <Button type="primary" icon={<PlusOutlined />} onClick={onAdd}>
+        <Button type="primary" icon={<PlusOutlined aria-hidden />} onClick={onAdd}>
           {t('pages.nodes.addNode')}
         </Button>
-        <Button icon={<SafetyCertificateOutlined />} onClick={onMtls}>
+        <Button icon={<SafetyCertificateOutlined aria-hidden />} onClick={onMtls}>
           {t('pages.nodes.mtls.title')}
         </Button>
         {selectedIds.length > 0 && (
-          <Button icon={<CloudDownloadOutlined />} onClick={onUpdateSelected}>
+          <Button icon={<CloudDownloadOutlined aria-hidden />} onClick={onUpdateSelected}>
             {t('pages.nodes.updateSelected', { count: selectedIds.length })}
           </Button>
         )}
@@ -551,7 +609,7 @@ export default function NodeList({
           <div className="node-cards">
             {dataSource.length === 0 ? (
               <div className="card-empty">
-                <ClusterOutlined style={{ fontSize: 28, opacity: 0.5 }} />
+                <ClusterOutlined aria-hidden style={{ fontSize: 28, opacity: 0.5 }} />
                 <div>{t('noData')}</div>
               </div>
             ) : (
@@ -563,11 +621,11 @@ export default function NodeList({
                     style={{ paddingInlineStart: 16, opacity: 0.85 }}
                   >
                     <div className="card-head">
-                      <ApartmentOutlined style={{ opacity: 0.6 }} />
+                      <ApartmentOutlined aria-hidden style={{ opacity: 0.6 }} />
                       <StatusDot status={record.status} xrayState={record.xrayState} />
                       <span className="node-name">{record.name}</span>
                       <div className="card-actions">
-                        <Tag icon={<ApartmentOutlined />} style={{ margin: 0 }}>
+                        <Tag icon={<ApartmentOutlined aria-hidden />} style={{ margin: 0 }}>
                           {t('pages.nodes.subNode')}
                         </Tag>
                       </div>
@@ -607,6 +665,7 @@ export default function NodeList({
                         <Switch
                           checked={!!record.enable}
                           size="small"
+                          aria-label={t('pages.nodes.enable')}
                           onChange={(v) => onToggleEnable(record, v)}
                         />
                         <Dropdown
@@ -618,7 +677,7 @@ export default function NodeList({
                                 key: 'probe',
                                 label: (
                                   <>
-                                    <ThunderboltOutlined /> {t('pages.nodes.probe')}
+                                    <ThunderboltOutlined aria-hidden /> {t('pages.nodes.probe')}
                                   </>
                                 ),
                                 onClick: () => onProbe(record),
@@ -629,7 +688,8 @@ export default function NodeList({
                                       key: 'update',
                                       label: (
                                         <>
-                                          <CloudDownloadOutlined /> {t('pages.nodes.updatePanel')}
+                                          <CloudDownloadOutlined aria-hidden />{' '}
+                                          {t('pages.nodes.updatePanel')}
                                         </>
                                       ),
                                       onClick: () => onUpdateNode(record),
@@ -640,7 +700,7 @@ export default function NodeList({
                                 key: 'edit',
                                 label: (
                                   <>
-                                    <EditOutlined /> {t('edit')}
+                                    <EditOutlined aria-hidden /> {t('edit')}
                                   </>
                                 ),
                                 onClick: () => onEdit(record),
@@ -650,7 +710,7 @@ export default function NodeList({
                                 danger: true,
                                 label: (
                                   <>
-                                    <DeleteOutlined /> {t('delete')}
+                                    <DeleteOutlined aria-hidden /> {t('delete')}
                                   </>
                                 ),
                                 onClick: () => onDelete(record),
@@ -662,7 +722,7 @@ export default function NodeList({
                             type="text"
                             size="small"
                             className="row-action-trigger"
-                            icon={<MoreOutlined />}
+                            icon={<MoreOutlined aria-hidden />}
                             aria-label={t('more')}
                           />
                         </Dropdown>
@@ -736,14 +796,16 @@ export default function NodeList({
                     const { tip, iconColor } = statusIssue(statsNode);
                     return tip ? (
                       <Tooltip title={tip}>
-                        <ExclamationCircleOutlined style={{ color: iconColor }} />
+                        <ExclamationCircleOutlined style={{ color: iconColor }} aria-label={tip} />
                       </Tooltip>
                     ) : null;
                   })()}
                 </div>
                 <div className="stat-row">
                   <span className="stat-label">{t('pages.nodes.cpu')}</span>
-                  <Tag>{formatPct(statsNode.cpuPct)}</Tag>
+                  <Tag>
+                    {formatPct(statsNode.cpuPct, !statsNode.unavailableMetrics?.includes('cpu'))}
+                  </Tag>
                 </div>
                 <div className="stat-row">
                   <span className="stat-label">{t('pages.nodes.mem')}</span>
@@ -761,7 +823,12 @@ export default function NodeList({
                 </div>
                 <div className="stat-row">
                   <span className="stat-label">{t('pages.nodes.uptime')}</span>
-                  <Tag>{formatUptime(statsNode.uptimeSecs)}</Tag>
+                  <Tag>
+                    {formatUptime(
+                      statsNode.uptimeSecs,
+                      !statsNode.unavailableMetrics?.includes('uptime'),
+                    )}
+                  </Tag>
                 </div>
                 <div className="stat-row">
                   <span className="stat-label">{t('pages.nodes.latency')}</span>
@@ -774,7 +841,7 @@ export default function NodeList({
                 <div className="stat-row">
                   <span className="stat-label">{t('clients')}</span>
                   <Tag>
-                    <TeamOutlined /> {statsNode.clientCount || 0}
+                    <TeamOutlined aria-hidden /> {statsNode.clientCount || 0}
                   </Tag>
                   {statsNode.activeCount ? (
                     <Tag color="green">
@@ -806,39 +873,7 @@ export default function NodeList({
           </Modal>
         </>
       ) : (
-        <Table<NodeRow>
-          dataSource={dataSource}
-          columns={columns}
-          pagination={false}
-          loading={loading}
-          scroll={{ x: 'max-content' }}
-          size="middle"
-          rowKey="key"
-          rowSelection={
-            dataSource.length > 1
-              ? {
-                  selectedRowKeys: selectedIds,
-                  onChange: (keys) =>
-                    onSelectionChange(keys.filter((k) => typeof k === 'number') as number[]),
-                  getCheckboxProps: (record) => ({
-                    disabled: !!record.transitive || !isUpdateEligible(record),
-                  }),
-                }
-              : undefined
-          }
-          locale={{
-            emptyText: (
-              <div className="card-empty">
-                <ClusterOutlined style={{ fontSize: 32, marginBottom: 8 }} />
-                <div>{t('noData')}</div>
-              </div>
-            ),
-          }}
-          expandable={{
-            expandedRowRender: (record) => <NodeHistoryPanel node={record} />,
-            rowExpandable: (record) => !record.transitive,
-          }}
-        />
+        nodeTable
       )}
     </Card>
   );

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -30,6 +31,8 @@ type trafficMutationBatch struct {
 	localPlans  []trafficLocalApplyPlan
 	remotePlans []trafficInboundUpdatePlan
 	nodeIDs     map[int]struct{}
+	// renewedEmails get their MTProto sidecar quota zeroed once the tick commits.
+	renewedEmails []string
 }
 
 type trafficInboundUpdatePlan struct{ oldInbound, newInbound model.Inbound }
@@ -57,22 +60,52 @@ func (b *trafficMutationBatch) markNodesTx(tx *gorm.DB) error {
 	return nil
 }
 
+// applyTrafficRemotePlans is bounded like every per-client node push: the nodes are
+// already dirty, so an offline or slow one defers to the reconcile.
+func (s *InboundService) applyTrafficRemotePlans(plans []trafficInboundUpdatePlan) bool {
+	byNode := make(map[int][]int)
+	var nodeIDs []int
+	for i := range plans {
+		nodeID := 0
+		if plans[i].newInbound.NodeID != nil {
+			nodeID = *plans[i].newInbound.NodeID
+		}
+		if _, seen := byNode[nodeID]; !seen {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+		byNode[nodeID] = append(byNode[nodeID], i)
+	}
+	failed, panics := fanoutInboundResults(nodeIDs, nodeFanoutConcurrency, func(n int) bool {
+		// One budget per node, not per inbound: a node choosing how many inbounds it reports
+		// must not choose how long the sync job waits on it before serving other nodes.
+		ctx, cancel := nodePushContext()
+		defer cancel()
+		indexes := byNode[nodeIDs[n]]
+		nodeFailed, nodePanics := fanoutInboundResults(indexes, inboundFanoutConcurrency, func(k int) bool {
+			plan := &plans[indexes[k]]
+			rt, push, _, err := s.nodePushPlan(&plan.newInbound)
+			if err == nil && push {
+				err = rt.UpdateInbound(ctx, &plan.oldInbound, &plan.newInbound)
+			}
+			if err != nil {
+				logger.Debug("traffic post-commit remote apply failed:", err)
+			}
+			return err != nil
+		})
+		return slices.Contains(nodeFailed, true) || slices.ContainsFunc(nodePanics, func(p error) bool { return p != nil })
+	})
+	needRestart := false
+	for i := range failed {
+		needRestart = needRestart || failed[i] || panics[i] != nil
+	}
+	return needRestart
+}
+
 func (s *InboundService) applyTrafficMutationBatch(b *trafficMutationBatch) bool {
 	if b == nil {
 		return false
 	}
 	needRestart := false
-	for i := range b.remotePlans {
-		plan := &b.remotePlans[i]
-		rt, err := s.runtimeFor(&plan.newInbound)
-		if err == nil {
-			err = rt.UpdateInbound(context.Background(), &plan.oldInbound, &plan.newInbound)
-		}
-		if err != nil {
-			logger.Debug("traffic post-commit remote apply failed:", err)
-			needRestart = true
-		}
-	}
 	for i := range b.localPlans {
 		plan := &b.localPlans[i]
 		if plan.inbound.Protocol == model.MTProto {
@@ -81,6 +114,10 @@ func (s *InboundService) applyTrafficMutationBatch(b *trafficMutationBatch) bool
 		}
 		if plan.inbound.Protocol == model.AmneziaWG {
 			s.applyLocalAmneziaWG(plan.inbound.Id)
+			continue
+		}
+		if plan.inbound.Protocol == model.TUIC {
+			s.applyLocalTuic(plan.inbound.Id)
 			continue
 		}
 		rt, err := s.runtimeFor(&plan.inbound)

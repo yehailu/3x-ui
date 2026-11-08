@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
+import '@testing-library/jest-dom/vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { FormProvider } from 'react-hook-form';
+import { FormProvider, useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
 import { Form, Input, InputNumber, Switch } from 'antd';
 import { z } from 'zod';
 
-import { FormField, useZodForm } from '@/components/form/rhf';
+import { FormField } from '@/components/form/rhf';
 
 const GB = 1024 * 1024 * 1024;
 
@@ -18,7 +20,8 @@ const Schema = z.object({
 type Values = z.infer<typeof Schema>;
 
 function Harness({ onSubmit }: { onSubmit: (values: Values) => void }) {
-  const methods = useZodForm(Schema, {
+  const methods = useForm<Values>({
+    resolver: zodResolver(Schema),
     defaultValues: { email: '', enabled: false, slug: '', bytes: 2 * GB },
   });
   return (
@@ -91,6 +94,10 @@ describe('FormField', () => {
     fireEvent.click(screen.getByText('Save'));
 
     await screen.findByText('email-required');
+    expect(screen.getByRole('textbox', { name: 'email' })).toHaveAccessibleDescription(
+      'email-required',
+    );
+    expect(screen.getByRole('textbox', { name: 'email' })).toHaveAttribute('aria-invalid', 'true');
     expect(onSubmit).not.toHaveBeenCalled();
   });
 });

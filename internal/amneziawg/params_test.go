@@ -8,7 +8,7 @@ import (
 )
 
 func TestGenerateObfuscation31DefaultRanges(t *testing.T) {
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		o := GenerateObfuscation31()
 		if o.Jc < 3 || o.Jc > 6 {
 			t.Fatalf("Jc = %d, want [3,6]", o.Jc)
@@ -96,7 +96,7 @@ func assertRangeWithin(t *testing.T, name, v string, min, max int64) (lo, hi int
 }
 
 func TestGenerateHValuesDistinct(t *testing.T) {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		h := generateHValues()
 		var prev int64
 		for i, v := range h {
@@ -117,7 +117,7 @@ func validObfuscation() Obfuscation31 {
 }
 
 func TestValidateObfuscationAcceptsGenerated(t *testing.T) {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if err := ValidateObfuscation(validObfuscation()); err != nil {
 			t.Fatalf("generated obfuscation set rejected: %v", err)
 		}
@@ -142,9 +142,9 @@ func TestValidateObfuscationRejectsBadJminJmax(t *testing.T) {
 
 func TestValidateObfuscationRejectsBadS3S4(t *testing.T) {
 	o := validObfuscation()
-	o.S3 = 65
+	o.S3 = 65536
 	if err := ValidateObfuscation(o); err == nil {
-		t.Fatal("S3 > 64 must be rejected")
+		t.Fatal("S3 past uint16 must be rejected: amneziawg-go's UAPI parser refuses it")
 	}
 	o = validObfuscation()
 	o.S4 = 33
@@ -155,6 +155,17 @@ func TestValidateObfuscationRejectsBadS3S4(t *testing.T) {
 	o.S3, o.S4 = -1, -1
 	if err := ValidateObfuscation(o); err == nil {
 		t.Fatal("negative S3/S4 must be rejected")
+	}
+}
+
+// Amnezia Premium ships S3=1045; 1636 is the largest cookie padding every platform can receive.
+func TestValidateServerObfuscationAcceptsLargeS3(t *testing.T) {
+	for _, s3 := range []int{1045, 1636} {
+		o := validObfuscation()
+		o.S3 = s3
+		if err := ValidateServerObfuscation(o); err != nil {
+			t.Fatalf("S3=%d must be accepted: %v", s3, err)
+		}
 	}
 }
 
@@ -378,8 +389,44 @@ func TestValidateConfigValueRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+// The plain 1420 default left no headroom for s4: it put full-size packets at
+// 1480+S4 on the wire and fragmented every one of them once S4 passed 20.
+func TestEffectiveMTUKeepsFullSizePacketsUnfragmented(t *testing.T) {
+	t.Parallel()
+
+	// 20 IPv4 + 8 UDP + 16 transport header + 16 poly1305 tag.
+	const encapOverhead = 60
+	const hostLinkMTU = 1500
+
+	for s4 := 0; s4 <= 32; s4++ {
+		mtu := EffectiveMTU(0, s4)
+		if wire := mtu + encapOverhead + s4; wire > hostLinkMTU {
+			t.Errorf("s4=%d: MTU %d puts a full-size transport packet at %d bytes on the wire, over the %d-byte host link", s4, mtu, wire, hostLinkMTU)
+		}
+	}
+}
+
+// TestEffectiveMTUPrefersTheAdminsValue: the S4-aware default is a fallback,
+// not an override -- an explicit MTU must survive untouched.
+func TestEffectiveMTUPrefersTheAdminsValue(t *testing.T) {
+	t.Parallel()
+
+	if got := EffectiveMTU(1380, 27); got != 1380 {
+		t.Errorf("EffectiveMTU(1380, 27) = %d, want the configured 1380", got)
+	}
+	if got := EffectiveMTU(0, 27); got != DefaultMTU-27 {
+		t.Errorf("EffectiveMTU(0, 27) = %d, want %d", got, DefaultMTU-27)
+	}
+	if got := EffectiveMTU(0, 0); got != DefaultMTU {
+		t.Errorf("EffectiveMTU(0, 0) = %d, want %d", got, DefaultMTU)
+	}
+	if got := EffectiveMTU(-5, 12); got != DefaultMTU-12 {
+		t.Errorf("a nonsense configured MTU must fall back, got %d", got)
+	}
+}
+
 // TestValidateObfuscationRejectsOutOfRangeJunkAndPadding pins the widths
-// amneziawg-go's UAPI actually parses: uint32 for jc/jmin/jmax, uint16 for s1-s4.
+// amneziawg-go's UAPI actually parses: uint32 for jc/jmin/jmax, uint16 for s1-s3.
 func TestValidateObfuscationRejectsOutOfRangeJunkAndPadding(t *testing.T) {
 	base := Obfuscation31{Jc: 4, Jmin: 40, Jmax: 70, S1: 20, S2: 30, S3: 20, S4: 20}
 	tests := []struct {
@@ -403,7 +450,55 @@ func TestValidateObfuscationRejectsOutOfRangeJunkAndPadding(t *testing.T) {
 		})
 	}
 	if err := ValidateObfuscation(Obfuscation31{Jc: 4, Jmin: 40, Jmax: 70, S1: 65535, S2: 30, S3: 20, S4: 20}); err != nil {
-		t.Fatalf("S1 at the uint16 maximum must stay valid: %v", err)
+		t.Fatalf("S1 at the uint16 maximum must stay valid for an outbound: %v", err)
+	}
+}
+
+// An inbound's handshakes must fit iOS's 1700-byte buffer: 148+S1, 92+S2 and 64+S3.
+func TestValidateServerObfuscationBoundsHandshakesByTheIOSBuffer(t *testing.T) {
+	base := Obfuscation31{Jc: 4, Jmin: 40, Jmax: 70, S1: 20, S2: 30, S3: 20, S4: 20}
+	for name, mut := range map[string]func(*Obfuscation31){
+		"S1 init over 1700 bytes":     func(o *Obfuscation31) { o.S1 = 1553 },
+		"S2 response over 1700 bytes": func(o *Obfuscation31) { o.S2 = 1609 },
+		"S3 cookie over 1700 bytes":   func(o *Obfuscation31) { o.S3 = 1637 },
+	} {
+		o := base
+		mut(&o)
+		if err := ValidateServerObfuscation(o); err == nil {
+			t.Fatalf("%s: an iOS client could never receive it, so the inbound must not save", name)
+		}
+	}
+	// 148+1552 and 92+1608 are exactly 1700; Amnezia Premium ships S1=284 S2=659.
+	for _, s := range [][2]int{{1552, 30}, {20, 1608}, {284, 659}} {
+		if err := ValidateServerObfuscation(Obfuscation31{Jc: 4, Jmin: 40, Jmax: 70, S1: s[0], S2: s[1], S3: 20, S4: 20}); err != nil {
+			t.Fatalf("S1=%d S2=%d must stay valid: %v", s[0], s[1], err)
+		}
+	}
+}
+
+// amneziawg-go refuses the whole device when H1-H4 overlap ("headers must not overlap",
+// device/uapi.go); 1-4 alone are legal and the engine's own default.
+func TestValidateObfuscationHOverlap(t *testing.T) {
+	base := Obfuscation31{Jc: 4, Jmin: 40, Jmax: 70, S1: 20, S2: 30, S3: 20, S4: 20}
+	reject := [][4]string{
+		{"100-200", "150-300", "400", "500"},
+		{"7", "7", "8", "9"},
+		{"3", "", "", ""}, // blank H3 keeps the engine default 3
+	}
+	for _, h := range reject {
+		o := base
+		o.H1, o.H2, o.H3, o.H4 = h[0], h[1], h[2], h[3]
+		if err := ValidateObfuscation(o); err == nil {
+			t.Fatalf("H=%v overlaps, amneziawg-go rejects it, so the inbound must not save", h)
+		}
+	}
+	accept := [][4]string{{"1", "2", "3", "4"}, {"", "", "", ""}, {"5-10", "11-20", "21", "22-30"}}
+	for _, h := range accept {
+		o := base
+		o.H1, o.H2, o.H3, o.H4 = h[0], h[1], h[2], h[3]
+		if err := ValidateObfuscation(o); err != nil {
+			t.Fatalf("H=%v must be accepted: %v", h, err)
+		}
 	}
 }
 
@@ -432,5 +527,38 @@ func TestValidateObfuscationRejectsMalformedSignaturePackets(t *testing.T) {
 				t.Fatalf("ValidateObfuscation rejected valid I5=%q: %v", spec, err)
 			}
 		})
+	}
+}
+
+// Each handshake initiation sends Jc junk packets and the I1-I5 packets, allocated from
+// these values; unbounded, one connection (an unauthenticated peer) killed the panel.
+func TestValidateObfuscationBoundsWhatAHandshakeAllocates(t *testing.T) {
+	for name, mutate := range map[string]func(*Obfuscation31){
+		"jc past the documented range": func(o *Obfuscation31) { o.Jc = maxJunkPackets + 1 },
+		"jmax past a datagram":         func(o *Obfuscation31) { o.Jmax = maxPreamblePacket + 1 },
+		"random bytes past a datagram": func(o *Obfuscation31) { o.I1 = "<r 70000>" },
+		"negative length":              func(o *Obfuscation31) { o.I2 = "<r -1>" },
+		"spec past a datagram":         func(o *Obfuscation31) { o.I3 = "<r 40000><rc 40000>" },
+	} {
+		o := validObfuscation()
+		mutate(&o)
+		if err := ValidateObfuscation(o); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	o := validObfuscation()
+	o.I1 = "<b 0xf6ab3267fa><r 1200><t>"
+	if err := ValidateObfuscation(o); err != nil {
+		t.Fatalf("an ordinary I1 was refused: %v", err)
+	}
+}
+
+// amneziawg-go stores the MTU as an int32; a wider value wraps and the device panics.
+func TestMTUIsBoundedWhereItIsSavedAndWhereItIsRead(t *testing.T) {
+	if err := ValidateMTU(MaxMTU + 1); err == nil {
+		t.Fatal("an MTU past 65535 was accepted")
+	}
+	if got := EffectiveMTU(1<<31, 0); got != MaxMTU {
+		t.Fatalf("EffectiveMTU(2^31) = %d, want a stored oversized value capped at %d", got, MaxMTU)
 	}
 }

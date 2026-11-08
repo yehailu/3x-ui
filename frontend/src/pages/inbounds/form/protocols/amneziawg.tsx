@@ -1,8 +1,11 @@
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Form, Input, InputNumber, Space, Switch } from 'antd';
+import { useFormContext, useWatch } from 'react-hook-form';
+import { Alert, Button, Form, Input, InputNumber, Space, Switch, Typography } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 
 import { FormField } from '@/components/form/rhf';
+import { useAmneziawgKernelReadiness } from '@/api/queries/useAmneziawgKernelReadiness';
 
 interface AmneziawgFieldsProps {
   awgPubKey: string;
@@ -16,22 +19,35 @@ export default function AmneziawgFields({
   regenInboundAwgObfuscation,
 }: AmneziawgFieldsProps) {
   const { t } = useTranslation();
+  const uid = useId();
+  const kernelModeOn = useWatch({ name: 'settings.server.kernelMode' });
+  const nodeId = useWatch({ name: 'nodeId' }) as number | null | undefined;
+  const remoteTarget = typeof nodeId === 'number';
+  const { formState } = useFormContext();
+  const { data: readiness } = useAmneziawgKernelReadiness(!remoteTarget);
+  const hostReady = remoteTarget || readiness?.ready !== false;
+  // The master can probe only its local host; a remote node checks on apply.
+  const savedKernelMode = Boolean(
+    (formState.defaultValues as { settings?: { server?: { kernelMode?: boolean } } } | undefined)
+      ?.settings?.server?.kernelMode,
+  );
+  const toggleDisabled = !hostReady && !savedKernelMode;
   return (
     <>
-      <Form.Item label={t('pages.xray.amneziawg.privateKey')}>
+      <Form.Item htmlFor={`${uid}-privateKey`} label={t('pages.xray.amneziawg.privateKey')}>
         <Space.Compact block>
           <FormField name={['settings', 'server', 'privateKey']} noStyle>
-            <Input style={{ width: 'calc(100% - 32px)' }} />
+            <Input id={`${uid}-privateKey`} style={{ width: 'calc(100% - 32px)' }} />
           </FormField>
           <Button
             aria-label={t('regenerate')}
-            icon={<ReloadOutlined />}
+            icon={<ReloadOutlined aria-hidden />}
             onClick={regenInboundAwg}
           />
         </Space.Compact>
       </Form.Item>
-      <Form.Item label={t('pages.xray.amneziawg.publicKey')}>
-        <Input value={awgPubKey} disabled />
+      <Form.Item htmlFor={`${uid}-publicKey`} label={t('pages.xray.amneziawg.publicKey')}>
+        <Input id={`${uid}-publicKey`} value={awgPubKey} disabled />
       </Form.Item>
       <FormField
         name={['settings', 'server', 'subnetIp']}
@@ -89,7 +105,7 @@ export default function AmneziawgFields({
         <Input placeholder="eth0" />
       </FormField>
       <Form.Item label={t('pages.xray.amneziawg.obfuscation')}>
-        <Button icon={<ReloadOutlined />} onClick={regenInboundAwgObfuscation}>
+        <Button icon={<ReloadOutlined aria-hidden />} onClick={regenInboundAwgObfuscation}>
           {t('pages.xray.amneziawg.regenerateObfuscation')}
         </Button>
       </Form.Item>
@@ -103,13 +119,13 @@ export default function AmneziawgFields({
         <InputNumber min={0} style={{ width: '100%' }} />
       </FormField>
       <FormField name={['settings', 'server', 's1']} label={t('pages.xray.amneziawg.s1')}>
-        <InputNumber min={0} style={{ width: '100%' }} />
+        <InputNumber min={0} max={1552} style={{ width: '100%' }} />
       </FormField>
       <FormField name={['settings', 'server', 's2']} label={t('pages.xray.amneziawg.s2')}>
-        <InputNumber min={0} style={{ width: '100%' }} />
+        <InputNumber min={0} max={1608} style={{ width: '100%' }} />
       </FormField>
       <FormField name={['settings', 'server', 's3']} label={t('pages.xray.amneziawg.s3')}>
-        <InputNumber min={0} max={64} style={{ width: '100%' }} />
+        <InputNumber min={0} max={1636} style={{ width: '100%' }} />
       </FormField>
       <FormField name={['settings', 'server', 's4']} label={t('pages.xray.amneziawg.s4')}>
         <InputNumber min={0} max={32} style={{ width: '100%' }} />
@@ -211,6 +227,44 @@ export default function AmneziawgFields({
       >
         <Switch />
       </FormField>
+      <FormField
+        name={['settings', 'server', 'kernelMode']}
+        label={t('pages.xray.amneziawg.kernelMode')}
+        extra={t('pages.xray.amneziawg.kernelModeHint')}
+        valueProp="checked"
+      >
+        <Switch disabled={toggleDisabled} />
+      </FormField>
+      {!hostReady && (
+        <Alert
+          type={kernelModeOn ? 'warning' : 'info'}
+          showIcon
+          title={t('pages.xray.amneziawg.kernelUnavailable')}
+          description={
+            <>
+              <ul style={{ margin: '0 0 8px', paddingInlineStart: 20 }}>
+                {(readiness?.blockers ?? []).map((b) => (
+                  <li key={`${b.code}:${b.detail ?? ''}`}>
+                    {t(`pages.xray.amneziawg.kernelBlocker.${b.code}`, {
+                      defaultValue: b.code,
+                    })}
+                    {b.detail ? ` (${b.detail})` : ''}
+                  </li>
+                ))}
+              </ul>
+              {readiness?.installCommand ? (
+                <Typography.Paragraph
+                  copyable={{ text: readiness.installCommand }}
+                  code
+                  style={{ marginBottom: 0 }}
+                >
+                  {readiness.installCommand}
+                </Typography.Paragraph>
+              ) : null}
+            </>
+          }
+        />
+      )}
     </>
   );
 }

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { OptionalClientKeepAliveSchema } from '@/schemas/primitives/keepalive';
 
 // AntD InputNumber emits null (not undefined) when the user clears it, and
 // the form store hands that null straight to safeParse on submit — a bare
@@ -23,7 +24,7 @@ export const AmneziawgClientSchema = z.object({
   publicKey: z.string().optional(),
   preSharedKey: z.string().optional(),
   allowedIPs: z.array(z.string()).default([]),
-  keepAlive: optionalClearedInt(z.number().int().min(0)),
+  keepAlive: OptionalClientKeepAliveSchema,
   forwardedPorts: z.string().default(''),
   email: z.string().min(1),
   limitIp: z.number().int().min(0).default(0),
@@ -53,7 +54,7 @@ export const AmneziawgServerSchema = z.object({
   publicKey: z.string().optional(),
   subnetIp: z.string().default('10.8.1.0'),
   subnetCidr: clearedToDefault(z.number().int().min(1).max(32).default(24)),
-  mtu: optionalClearedInt(z.number().int().min(1)),
+  mtu: optionalClearedInt(z.number().int().min(1).max(65535)),
   primaryDns: z.string().default('8.8.8.8'),
   secondaryDns: z.string().default('8.8.4.4'),
   externalInterface: z.string().default(''),
@@ -66,14 +67,17 @@ export const AmneziawgServerSchema = z.object({
   // z.object's default unknown-key stripping doesn't silently drop it from
   // an existing stored settings blob on the next save.
   routeThroughXray: z.boolean().default(false).optional(),
+  // kernelMode runs this inbound on the DKMS kernel module instead of the
+  // embedded userspace stack -- no Xray routing, sniffing, IPv6 or port forwarding.
+  kernelMode: z.boolean().default(false).optional(),
   // Upper bounds match amneziawg-go's own UAPI parsers (device/uapi.go):
-  // jc/jmin/jmax are uint32, s1-s4 uint16. Wider values make IpcSet fail.
-  jc: clearedToDefault(z.number().int().min(0).max(4294967295).default(5)),
-  jmin: clearedToDefault(z.number().int().min(0).max(4294967295).default(10)),
-  jmax: clearedToDefault(z.number().int().min(0).max(4294967295).default(50)),
-  s1: clearedToDefault(z.number().int().min(0).max(65535).default(30)),
-  s2: clearedToDefault(z.number().int().min(0).max(65535).default(45)),
-  s3: clearedToDefault(z.number().int().min(0).max(64).default(10)),
+  // Every handshake allocates jc packets of jmin..jmax bytes; s1-s4 are uint16.
+  jc: clearedToDefault(z.number().int().min(0).max(128).default(5)),
+  jmin: clearedToDefault(z.number().int().min(0).max(65535).default(10)),
+  jmax: clearedToDefault(z.number().int().min(0).max(65535).default(50)),
+  s1: clearedToDefault(z.number().int().min(0).max(1552).default(30)),
+  s2: clearedToDefault(z.number().int().min(0).max(1608).default(45)),
+  s3: clearedToDefault(z.number().int().min(0).max(1636).default(10)),
   s4: clearedToDefault(z.number().int().min(0).max(32).default(5)),
   h1: z.string().default(''),
   h2: z.string().default(''),

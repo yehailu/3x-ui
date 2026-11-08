@@ -23,9 +23,9 @@ package amneziawgnet
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"time"
 
@@ -134,14 +134,11 @@ func desiredPeerTargets(inst amneziawg.Instance) map[string]netip.Addr {
 	return out
 }
 
-// desiredPortForwardKeys returns the full set of listener keys inst wants
-// right now: one tcpForward and one udpForward key per port in every peer's
-// ForwardedPorts spec, for every peer that also has a resolvable target
-// (see desiredPeerTargets) -- a key never exists without a target, so
-// Reconcile can always resolve one for any key it opens.
-func desiredPortForwardKeys(inst amneziawg.Instance) map[portForwardKey]struct{} {
-	out := map[portForwardKey]struct{}{}
+// forwardingPeers is the one gate a host listener comes from: no email, port
+// spec and resolvable target (see desiredPeerTargets), no socket.
+func forwardingPeers(inst amneziawg.Instance) []amneziawg.Peer {
 	targets := desiredPeerTargets(inst)
+	out := make([]amneziawg.Peer, 0, len(inst.Peers))
 	for _, p := range inst.Peers {
 		if p.Email == "" || p.ForwardedPorts == "" {
 			continue
@@ -149,12 +146,35 @@ func desiredPortForwardKeys(inst amneziawg.Instance) map[portForwardKey]struct{}
 		if _, ok := targets[p.Email]; !ok {
 			continue
 		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// desiredPortForwardKeys returns every listener key inst wants right now: one
+// tcpForward and one udpForward per forwarded port of the forwarding peers.
+func desiredPortForwardKeys(inst amneziawg.Instance) map[portForwardKey]struct{} {
+	out := map[portForwardKey]struct{}{}
+	for _, p := range forwardingPeers(inst) {
 		for _, port := range amneziawg.ExpandForwardedPorts(p.ForwardedPorts) {
 			out[portForwardKey{email: p.Email, port: port, proto: tcpForward}] = struct{}{}
 			out[portForwardKey{email: p.Email, port: port, proto: udpForward}] = struct{}{}
 		}
 	}
 	return out
+}
+
+// ForwardedPortOwner names the peer Reconcile opens a listener on port for --
+// the same peers and expansion as desiredPortForwardKeys, never a silent one.
+func ForwardedPortOwner(inst amneziawg.Instance, port int) (string, bool) {
+	for _, p := range forwardingPeers(inst) {
+		for _, candidate := range amneziawg.ExpandForwardedPorts(p.ForwardedPorts) {
+			if candidate == port {
+				return p.Email, true
+			}
+		}
+	}
+	return "", false
 }
 
 // Reconcile brings the supervisor's open listeners in line with what inst
@@ -250,6 +270,43 @@ func openPortForwardListener(gstack *stack.Stack, inboundID int, key portForward
 
 const portForwardDialTimeout = 10 * time.Second
 
+// portForwardMaxFlows caps live TCP relays, and separately UDP sessions, over every
+// listener: senders are unauthenticated, and each flow pins a goroutine and a buffer.
+const portForwardMaxFlows = 2048
+
+// Process-wide on purpose: a per-listener cap still multiplies by the forwarded ports
+// and by the number of forwarding peers.
+var (
+	portForwardTCPSlots = make(chan struct{}, portForwardMaxFlows)
+	portForwardUDPSlots = make(chan struct{}, portForwardMaxFlows)
+)
+
+// acquirePortForwardSlot never blocks the accept or read loop; false means the flow is
+// refused. The owner gives the slot back by receiving from slots.
+func acquirePortForwardSlot(slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// acceptRetryDelay paces an accept loop's retries, so an error that lasts
+// (EMFILE, until descriptors free up) neither spins it nor floods the log.
+const acceptRetryDelay = 100 * time.Millisecond
+
+// waitAcceptRetry sleeps acceptRetryDelay after a failed Accept; false means
+// closing fired meanwhile and the loop should return instead of retrying.
+func waitAcceptRetry(closing <-chan struct{}) bool {
+	select {
+	case <-closing:
+		return false
+	case <-time.After(acceptRetryDelay):
+		return true
+	}
+}
+
 // tunnelNetwork returns the gVisor network protocol number matching addr's
 // address family, for dialing toward it inside the embedded stack.
 func tunnelNetwork(addr netip.Addr) tcpip.NetworkProtocolNumber {
@@ -270,10 +327,11 @@ func tunnelFullAddress(addr netip.Addr, port int) tcpip.FullAddress {
 }
 
 // tcpForwardListener is one open host-facing TCP listener for a single
-// portForwardKey.
+// portForwardKey; ctx ends with it and takes every relay it started along.
 type tcpForwardListener struct {
-	ln      net.Listener
-	closing chan struct{}
+	ln     net.Listener
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // listenPortForwardTCP opens a host-facing TCP listener on key.port and
@@ -284,12 +342,13 @@ type tcpForwardListener struct {
 // result as "not open this round" and retries on every future Reconcile
 // call for as long as the key stays desired.
 func listenPortForwardTCP(gstack *stack.Stack, inboundID int, key portForwardKey, target portForwardTargetFunc) *tcpForwardListener {
-	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", fmt.Sprintf(":%d", key.port))
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort(wildcardBindHost, strconv.Itoa(key.port)))
 	if err != nil {
 		logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: listen tcp :%d: %v", inboundID, key.email, key.port, err)
 		return nil
 	}
-	l := &tcpForwardListener{ln: ln, closing: make(chan struct{})}
+	l := &tcpForwardListener{ln: ln}
+	l.ctx, l.cancel = context.WithCancel(context.Background())
 	logger.Infof("amneziawgnet: port-forward: inbound %d peer %q: listening tcp :%d", inboundID, key.email, key.port)
 	go l.acceptLoop(gstack, inboundID, key, target)
 	return l
@@ -300,24 +359,36 @@ func (l *tcpForwardListener) acceptLoop(gstack *stack.Stack, inboundID int, key 
 		conn, err := l.ln.Accept()
 		if err != nil {
 			select {
-			case <-l.closing:
+			case <-l.ctx.Done():
 				return // intentional shutdown, not a real accept error
 			default:
 			}
 			logger.Warningf("amneziawgnet: port-forward: inbound %d peer %q: accept tcp :%d: %v", inboundID, key.email, key.port, err)
-			return
+			// Keep accepting: returning would strand a bound socket nobody
+			// serves, under a key Reconcile still sees as open and never reopens.
+			if !waitAcceptRetry(l.ctx.Done()) {
+				return
+			}
+			continue
 		}
-		go relayTCPForward(gstack, conn, inboundID, key, target)
+		if !acquirePortForwardSlot(portForwardTCPSlots) {
+			conn.Close()
+			continue
+		}
+		go func() {
+			defer func() { <-portForwardTCPSlots }()
+			l.relayTCPForward(gstack, conn, inboundID, key, target)
+		}()
 	}
 }
 
-func relayTCPForward(gstack *stack.Stack, conn net.Conn, inboundID int, key portForwardKey, target portForwardTargetFunc) {
+func (l *tcpForwardListener) relayTCPForward(gstack *stack.Stack, conn net.Conn, inboundID int, key portForwardKey, target portForwardTargetFunc) {
 	defer conn.Close()
 	addr, ok := target(key.email)
 	if !ok {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), portForwardDialTimeout)
+	ctx, cancel := context.WithTimeout(l.ctx, portForwardDialTimeout)
 	defer cancel()
 	tunnelConn, err := gonet.DialContextTCP(ctx, gstack, tunnelFullAddress(addr, key.port), tunnelNetwork(addr))
 	if err != nil {
@@ -326,14 +397,17 @@ func relayTCPForward(gstack *stack.Stack, conn net.Conn, inboundID int, key port
 	}
 	defer tunnelConn.Close()
 
+	stop := context.AfterFunc(l.ctx, func() {
+		conn.Close()
+		tunnelConn.Close()
+	})
+	defer stop()
 	pipeBothWays(conn, tunnelConn)
 }
 
-// Close stops accepting new connections. Already-relaying connections are
-// left to finish on their own -- there's no shared state to tear down early
-// for, and an abrupt cut would just look like a network error to whichever
-// external client was mid-transfer.
+// Close stops accepting and cuts the connections already relaying, as
+// udpForwardListener.Close does: a withdrawn forward must not stay usable.
 func (l *tcpForwardListener) Close() {
-	close(l.closing)
+	l.cancel()
 	l.ln.Close()
 }

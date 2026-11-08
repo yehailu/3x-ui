@@ -4,13 +4,17 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 	_ "unsafe"
 
@@ -20,7 +24,6 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/sub"
 	"github.com/mhsanaei/3x-ui/v3/internal/tunnelmonitor"
-	"github.com/mhsanaei/3x-ui/v3/internal/util/crypto"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/sys"
 	"github.com/mhsanaei/3x-ui/v3/internal/web"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/global"
@@ -35,6 +38,10 @@ import (
 // cliFallbackTokenName is the single token the CLI regenerates, so `-getApiToken`
 // cannot accumulate admin-equivalent credentials that are never revoked.
 const cliFallbackTokenName = "cli-fallback"
+
+// installTokenName is minted once on a panel with no tokens and is deliberately
+// not the rotated slot, so the credential the installer recorded keeps working.
+const installTokenName = "install"
 
 // initNodeTokenCrypto loads the process codec, preferring the key file over
 // the environment and failing closed when an enabled policy lacks a key.
@@ -107,8 +114,17 @@ func runWebServer() {
 	if err != nil {
 		log.Fatalf("Error initializing database: %v", err)
 	}
+	// Created here, not in InitDB: a CLI call's output is often piped away, and
+	// this log is the one place an operator reads the first login from.
+	username, password, err := database.EnsureFirstUser()
+	if err != nil {
+		log.Fatalf("Error creating the first panel user: %v", err)
+	}
+	if password != "" {
+		log.Printf("No panel user existed, so one was generated. Username: %s  Password: %s  (shown once; change it in Panel Settings)", username, password)
+	}
 
-	server := web.NewServer()
+	server := web.NewServer(sub.NewLinkProvider())
 	global.SetWebServer(server)
 	err = server.Start()
 	if err != nil {
@@ -116,7 +132,6 @@ func runWebServer() {
 	}
 
 	sub.SetDistFS(web.EmbeddedDist())
-	service.RegisterSubLinkProvider(sub.NewLinkProvider())
 	subServer := sub.NewServer()
 	global.SetSubServer(subServer)
 	err = subServer.Start()
@@ -170,7 +185,7 @@ func runWebServer() {
 				logger.Debug("Error stopping sub server:", err)
 			}
 
-			server = web.NewServer()
+			server = web.NewServer(sub.NewLinkProvider())
 			global.SetWebServer(server)
 			err = server.StartPanelOnly()
 			if err != nil {
@@ -202,7 +217,9 @@ func runWebServer() {
 			tgbot.StopBot()
 			// ------------------------------------------------------------
 
-			_ = server.Stop()
+			if err := server.Stop(); err != nil {
+				logger.Error("Server shutdown failed:", err)
+			}
 			_ = subServer.Stop()
 			log.Println("Shutting down servers.")
 			return
@@ -253,13 +270,9 @@ func showSetting(show bool) {
 		}
 
 		userService := panel.UserService{}
-		userModel, err := userService.GetFirstUser()
+		hasDefaultCredential, err := userService.HasDefaultCredential()
 		if err != nil {
 			fmt.Println("get current user info failed, error info:", err)
-		}
-
-		if userModel.Username == "" || userModel.Password == "" {
-			fmt.Println("current username or password is empty")
 		}
 
 		fmt.Println("current panel settings as follows:")
@@ -268,10 +281,6 @@ func showSetting(show bool) {
 		} else {
 			fmt.Println("Panel is secure with SSL")
 		}
-
-		hasDefaultCredential := func() bool {
-			return userModel.Username == "admin" && crypto.CheckPasswordHash(userModel.Password, "admin")
-		}()
 
 		fmt.Println("hasDefaultCredential:", hasDefaultCredential)
 		fmt.Println("port:", port)
@@ -493,10 +502,13 @@ func GetListenIP(getListen bool) {
 	}
 }
 
-func GetApiToken(getApiToken bool) {
+func GetApiToken(getApiToken bool, tokenName, tokenScope string) {
 	if !getApiToken {
 		return
 	}
+	// An explicit name applies to both branches below; without one each keeps
+	// the name it already used, so every existing invocation is unaffected.
+	name := strings.TrimSpace(tokenName)
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
 		fmt.Println("open database failed, error info:", err)
@@ -512,18 +524,25 @@ func GetApiToken(getApiToken bool) {
 		fmt.Printf("There are %d API token(s) configured. Existing tokens cannot be retrieved in plaintext because only hashes are stored.\n", len(tokens))
 		fmt.Println("If you have lost your token, you can manage and generate new tokens through the Panel UI (Settings -> API Tokens).")
 
-		// Rotate one reusable fallback so repeated calls cannot pile up
+		// Rotate one token per name so repeated calls cannot pile up
 		// indefinitely many admin-equivalent tokens that never expire.
-		created, err := apiTokenService.RecreateByName(cliFallbackTokenName)
+		rotated := name
+		if rotated == "" {
+			rotated = cliFallbackTokenName
+		}
+		created, err := apiTokenService.RecreateByName(rotated, tokenScope)
 		if err != nil {
 			fmt.Println("Failed to create a fallback API token:", err)
 			return
 		}
-		fmt.Println("\nThe CLI fallback token has been regenerated (any previous one is now invalid):")
+		fmt.Printf("\nThe API token %q has been regenerated (any previous one is now invalid):\n", rotated)
 		fmt.Println("apiToken:", created.Token)
 		return
 	}
-	created, err := apiTokenService.Create("install", "", 0)
+	if name == "" {
+		name = installTokenName
+	}
+	created, err := apiTokenService.Create(name, tokenScope, 0)
 	if err != nil {
 		fmt.Println("create apiToken failed, error info:", err)
 		return
@@ -605,6 +624,8 @@ func main() {
 	var show bool
 	var getCert bool
 	var getApiToken bool
+	var tokenName string
+	var tokenScope string
 	var resetTwoFactor bool
 	settingCmd.BoolVar(&reset, "reset", false, "Reset all settings")
 	settingCmd.BoolVar(&show, "show", false, "Display current settings")
@@ -616,7 +637,9 @@ func main() {
 	settingCmd.BoolVar(&resetTwoFactor, "resetTwoFactor", false, "Reset two-factor authentication settings")
 	settingCmd.BoolVar(&getListen, "getListen", false, "Display current panel listenIP IP")
 	settingCmd.BoolVar(&getCert, "getCert", false, "Display current certificate settings")
-	settingCmd.BoolVar(&getApiToken, "getApiToken", false, "Display current API token")
+	settingCmd.BoolVar(&getApiToken, "getApiToken", false, "Print an API token for CLI use, regenerating it and invalidating the previous one; on a panel with no tokens yet it mints one instead")
+	settingCmd.StringVar(&tokenName, "tokenName", "", "Name of the token -getApiToken acts on (default: "+cliFallbackTokenName+", or "+installTokenName+" on a panel with no tokens)")
+	settingCmd.StringVar(&tokenScope, "tokenScope", "", "Scope of the token -getApiToken issues: admin, monitor or node-sync (default: the scope of the token it replaces, or admin for a new one)")
 	settingCmd.StringVar(&webCertFile, "webCert", "", "Set path to public key file for panel")
 	settingCmd.StringVar(&webKeyFile, "webCertKey", "", "Set path to private key file for panel")
 	settingCmd.StringVar(&tgbottoken, "tgbottoken", "", "Set token for Telegram bot")
@@ -644,6 +667,8 @@ func main() {
 			return
 		}
 		runWebServer()
+	case "install-awg-kernel":
+		installAmneziaWGKernelModule()
 	case "migrate":
 		migrateDb()
 	case "encrypt-tokens":
@@ -688,6 +713,11 @@ func main() {
 			fmt.Println(err)
 			return
 		}
+		// flag stops parsing at the first non-flag argument, so the `-getApiToken true`
+		// form drops every flag written after it. Say so instead of acting on a default.
+		if rest := settingCmd.Args(); len(rest) > 0 {
+			fmt.Printf("warning: ignored %q and any flags after it; put flags before positional arguments\n", strings.Join(rest, " "))
+		}
 		if reset {
 			if err = resetSetting(); err != nil {
 				return
@@ -710,7 +740,7 @@ func main() {
 			GetCertificate(getCert)
 		}
 		if getApiToken {
-			GetApiToken(getApiToken)
+			GetApiToken(getApiToken, tokenName, tokenScope)
 		}
 		if (tgbottoken != "") || (tgbotchatid != "") || (tgbotRuntime != "") {
 			updateTgbotSetting(tgbottoken, tgbotchatid, tgbotRuntime)
@@ -746,5 +776,51 @@ Commands:
     migrate-db     SQLite <-> .dump (--dump/--restore) or copy into PostgreSQL (--dsn)
     encrypt-tokens encrypt node bearer tokens with the configured active key
     setting        set settings
+    install-awg-kernel
+                   build and install the AmneziaWG kernel module (required for
+                   an AmneziaWG inbound's kernel mode)
 `
+}
+
+//go:embed scripts/install-amneziawg-kernel.sh
+var installAwgKernelScript []byte
+
+// installAmneziaWGKernelModule runs the bundled module installer.
+// It needs a terminal for its apt and DKMS build output.
+func installAmneziaWGKernelModule() {
+	if runtime.GOOS != "linux" {
+		fmt.Println("the AmneziaWG kernel module is Linux-only")
+		return
+	}
+	if os.Geteuid() != 0 {
+		exe, err := os.Executable()
+		if err != nil || exe == "" {
+			exe = "/usr/local/x-ui/x-ui"
+		}
+		fmt.Println("run as root: sudo " + exe + " install-awg-kernel")
+		return
+	}
+
+	f, err := os.CreateTemp("", "install-amneziawg-kernel-*.sh")
+	if err != nil {
+		fmt.Println("could not stage the installer:", err)
+		return
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(installAwgKernelScript); err != nil {
+		f.Close()
+		fmt.Println("could not write the installer:", err)
+		return
+	}
+	f.Close()
+
+	// No timeout: an apt+dkms build legitimately runs for minutes.
+	cmd := exec.CommandContext(context.Background(), "bash", f.Name())
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		fmt.Println("install failed:", err)
+		os.Exit(1)
+	}
 }

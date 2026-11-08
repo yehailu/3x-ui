@@ -228,6 +228,21 @@ describe('formValuesToWirePayload', () => {
     expect(payload.sniffing).toBe('');
   });
 
+  // xray-core 26.10.31 (#7295): the XHTTP server reads h2Params; the form must not strip it.
+  it('keeps an XHTTP inbound h2Params set through JSON', () => {
+    const h2Params = { MaxConcurrentStreams: 512, MaxReadFrameSize: 1048576 };
+    const values = rawInboundToFormValues({
+      ...vlessRow,
+      streamSettings: {
+        network: 'xhttp',
+        security: 'none',
+        xhttpSettings: { path: '/x', mode: 'auto', h2Params },
+      },
+    });
+    const payload = formValuesToWirePayload(values);
+    expect(JSON.parse(payload.streamSettings).xhttpSettings.h2Params).toEqual(h2Params);
+  });
+
   it('omits nodeId when null', () => {
     const values = rawInboundToFormValues({ ...vlessRow, nodeId: null });
     const payload = formValuesToWirePayload(values);
@@ -294,6 +309,35 @@ describe('formValuesToWirePayload', () => {
   });
 });
 
+describe('excludeFromSub', () => {
+  it('DBInbound constructor preserves excludeFromSub from the API row', () => {
+    expect(new DBInbound({ excludeFromSub: true }).excludeFromSub).toBe(true);
+    expect(new DBInbound({ excludeFromSub: false }).excludeFromSub).toBe(false);
+  });
+
+  it('DBInbound defaults excludeFromSub to false when the API omits it', () => {
+    expect(new DBInbound({ protocol: 'vless' }).excludeFromSub).toBe(false);
+    expect(new DBInbound().excludeFromSub).toBe(false);
+  });
+
+  it('rawInboundToFormValues reads excludeFromSub and defaults to false', () => {
+    expect(rawInboundToFormValues({ ...vlessRow, excludeFromSub: true }).excludeFromSub).toBe(true);
+    expect(rawInboundToFormValues(vlessRow).excludeFromSub).toBe(false);
+  });
+
+  it('formValuesToWirePayload includes excludeFromSub', () => {
+    const values = rawInboundToFormValues({ ...vlessRow, excludeFromSub: true });
+    expect(formValuesToWirePayload(values).excludeFromSub).toBe(true);
+  });
+
+  it('excludeFromSub survives raw → DBInbound → values → payload (the edit round-trip)', () => {
+    const db = new DBInbound({ ...vlessRow, excludeFromSub: true } as unknown as DBInboundInit);
+    const values = rawInboundToFormValues(db as unknown as RawInboundRow);
+    const payload = formValuesToWirePayload(values);
+    expect(payload.excludeFromSub).toBe(true);
+  });
+});
+
 describe('disableFlow', () => {
   it('DBInbound constructor preserves disableFlow from the API row', () => {
     expect(new DBInbound({ disableFlow: true }).disableFlow).toBe(true);
@@ -329,10 +373,10 @@ describe('subSortIndex', () => {
     expect(values.subSortIndex).toBe(1);
   });
 
-  it('rawInboundToFormValues preserves valid values and clamps below-minimum ones to 1', () => {
+  it('rawInboundToFormValues preserves positives and negatives; maps 0/absent to 1', () => {
     expect(rawInboundToFormValues({ ...vlessRow, subSortIndex: 5 }).subSortIndex).toBe(5);
     expect(rawInboundToFormValues({ ...vlessRow, subSortIndex: 0 }).subSortIndex).toBe(1);
-    expect(rawInboundToFormValues({ ...vlessRow, subSortIndex: -10 }).subSortIndex).toBe(1);
+    expect(rawInboundToFormValues({ ...vlessRow, subSortIndex: -10 }).subSortIndex).toBe(-10);
   });
 
   it('formValuesToWirePayload includes subSortIndex in the payload', () => {
@@ -348,18 +392,15 @@ describe('subSortIndex', () => {
     expect(replay.subSortIndex).toBe(42);
   });
 
-  it('InboundDbFieldsSchema enforces an integer minimum of 1 and defaults to 1', () => {
+  it('InboundDbFieldsSchema accepts integers including negatives and defaults to 1', () => {
     // Reject for the RIGHT reason: the issue must be about subSortIndex, not some
     // unrelated field — otherwise a schema that rejects everything would pass.
     const nonInt = InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 1.5 });
     expect(nonInt.success).toBe(false);
     if (!nonInt.success) expect(nonInt.error.issues[0]?.path).toContain('subSortIndex');
 
-    const belowMin = InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 0 });
-    expect(belowMin.success).toBe(false);
-    if (!belowMin.success) expect(belowMin.error.issues[0]?.path).toContain('subSortIndex');
-
-    // A valid integer >= 1 must pass (guards against a mutant rejecting all values).
+    expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 0 }).success).toBe(true);
+    expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: -1 }).success).toBe(true);
     expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 5 }).success).toBe(true);
     expect(InboundDbFieldsSchema.parse({}).subSortIndex).toBe(1);
   });

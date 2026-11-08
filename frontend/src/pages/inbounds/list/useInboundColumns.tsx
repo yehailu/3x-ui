@@ -23,6 +23,7 @@ import {
   shadowsocksNetworkLabel,
   tunnelNetworkLabel,
   mixedNetworkLabel,
+  formatHostRemarksLabel,
 } from './helpers';
 import type { ClientCountEntry, DBInboundRecord, InboundSpeedEntry, RowAction } from './types';
 
@@ -31,6 +32,7 @@ interface UseInboundColumnsParams {
   hasAnySubSortIndex: boolean;
   hasActiveNode: boolean;
   nodesById: Map<number, NodeRecord>;
+  hostRemarksByInboundId: Map<number, string[]>;
   clientCount: Record<number, ClientCountEntry>;
   inboundSpeed: Record<number, InboundSpeedEntry>;
   subEnable: boolean;
@@ -45,6 +47,7 @@ export function useInboundColumns({
   hasAnySubSortIndex,
   hasActiveNode,
   nodesById,
+  hostRemarksByInboundId,
   clientCount,
   inboundSpeed,
   subEnable,
@@ -127,7 +130,11 @@ export function useInboundColumns({
         align: 'center',
         width: 80,
         render: (_, record) => (
-          <Switch checked={record.enable} onChange={(next) => onSwitchEnable(record, next)} />
+          <Switch
+            aria-label={t('pages.inbounds.enable')}
+            checked={record.enable}
+            onChange={(next) => onSwitchEnable(record, next)}
+          />
         ),
       },
     ];
@@ -138,8 +145,23 @@ export function useInboundColumns({
         dataIndex: 'remark',
         key: 'remark',
         align: 'center',
-        width: 90,
+        width: 140,
         sorter: (a, b) => compareText(a.remark, b.remark),
+        render: (_, record) => {
+          const hostRemarks = hostRemarksByInboundId.get(record.id) ?? [];
+          if (hostRemarks.length === 0) {
+            return record.remark || null;
+          }
+          const { display, full } = formatHostRemarksLabel(hostRemarks);
+          return (
+            <div className="inbound-remark-cell">
+              <div className="inbound-remark">{record.remark}</div>
+              <Tooltip title={full}>
+                <div className="inbound-host-remarks">({display})</div>
+              </Tooltip>
+            </div>
+          );
+        },
       });
     }
 
@@ -199,7 +221,7 @@ export function useInboundColumns({
               {record.protocol}
             </Tag>,
           ];
-          if (record.isWireguard || record.isAmneziawg || record.isHysteria) {
+          if (record.isWireguard || record.isAmneziawg || record.isHysteria || record.isTuic) {
             tags.push(
               <Tag key="n" color="green">
                 UDP
@@ -275,7 +297,7 @@ export function useInboundColumns({
                 className="client-count-tag"
                 style={{ margin: 0, marginRight: 4, padding: '0 2px' }}
               >
-                <TeamOutlined /> {cc.clients}
+                <TeamOutlined aria-hidden /> {cc.clients}
               </Tag>
               {cc.active.length > 0 ? (
                 <Popover
@@ -453,6 +475,7 @@ export function useInboundColumns({
     hasAnySubSortIndex,
     hasActiveNode,
     nodesById,
+    hostRemarksByInboundId,
     clientCount,
     inboundSpeed,
     subEnable,

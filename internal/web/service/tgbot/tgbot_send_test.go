@@ -6,12 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
+	"github.com/nicksnyder/go-i18n/v2/i18n"
 )
 
 func TestIsTelegramNotModifiedError(t *testing.T) {
@@ -37,6 +39,9 @@ func TestIsTelegramNotModifiedError(t *testing.T) {
 	}
 }
 
+// telego.NewBot rejects any token that does not match `^\d+:[\w-]{35}$`.
+var testBotToken = "123456:" + strings.Repeat("a", 35)
+
 func TestEditMessageTgBotSkipsNotModified(t *testing.T) {
 	// Mock Telegram API that always returns "message is not modified".
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,10 +55,10 @@ func TestEditMessageTgBotSkipsNotModified(t *testing.T) {
 	defer mock.Close()
 
 	// Point the package-level bot at the mock.
-	origBot := bot
-	t.Cleanup(func() { bot = origBot })
+	origBot := liveBot()
+	t.Cleanup(func() { setTestBot(origBot) })
 	var err error
-	bot, err = telego.NewBot("test-token", telego.WithAPIServer(mock.URL))
+	bot, err = telego.NewBot(testBotToken, telego.WithAPIServer(mock.URL))
 	if err != nil {
 		t.Fatalf("NewBot: %v", err)
 	}
@@ -82,10 +87,10 @@ func TestEditMessageCallbackTgBotSkipsNotModified(t *testing.T) {
 	}))
 	defer mock.Close()
 
-	origBot := bot
-	t.Cleanup(func() { bot = origBot })
+	origBot := liveBot()
+	t.Cleanup(func() { setTestBot(origBot) })
 	var err error
-	bot, err = telego.NewBot("test-token", telego.WithAPIServer(mock.URL))
+	bot, err = telego.NewBot(testBotToken, telego.WithAPIServer(mock.URL))
 	if err != nil {
 		t.Fatalf("NewBot: %v", err)
 	}
@@ -131,5 +136,39 @@ func TestPageMessageSplitsLinkListWithoutBlankLines(t *testing.T) {
 	}
 	if links != 50 {
 		t.Errorf("pages contain %d links, want 50", links)
+	}
+}
+
+// Regression test: callback answers are shown as plain text, so the entities
+// I18nBot escapes for HTML-parsed messages must not surface in them.
+func TestCallbackAnswerIsPlainText(t *testing.T) {
+	var mu sync.Mutex
+	var texts []string
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bot"+testBotToken+"/answerCallbackQuery" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		texts = append(texts, body.Text)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+	}))
+	defer mock.Close()
+	swapTestBot(t, mock.URL)
+	draftLocalizer(t, &i18n.Message{ID: "tgbot.answers.canceled", Other: "❌ {{ .Email }}: Operation canceled."})
+
+	tb := &Tgbot{}
+	tb.sendCallbackAnswerTgBot("q1", tb.I18nBot("tgbot.answers.canceled", "Email==a&b<c>"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(texts) != 1 || texts[0] != "❌ a&b<c>: Operation canceled." {
+		t.Errorf("answerCallbackQuery texts = %q, want the e-mail shown verbatim", texts)
 	}
 }

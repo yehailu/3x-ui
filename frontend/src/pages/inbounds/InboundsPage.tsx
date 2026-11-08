@@ -38,6 +38,8 @@ import { useTheme } from '@/hooks/useTheme';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useNodesQuery } from '@/api/queries/useNodesQuery';
+import { useHostsQuery } from '@/api/queries/useHostsQuery';
+import { withHostEndpoints } from '@/lib/hosts/host-link';
 import AppSidebar from '@/layouts/AppSidebar';
 const TextModal = lazy(() => import('@/components/feedback/TextModal'));
 import type { TextModalTab } from '@/components/feedback/TextModal';
@@ -49,7 +51,6 @@ import { LazyMount } from '@/components/utility';
 const InboundFormModal = lazy(() => import('./form/InboundFormModal'));
 const CloneInboundModal = lazy(() => import('./CloneInboundModal'));
 const InboundInfoModal = lazy(() => import('./info/InboundInfoModal'));
-const QrCodeModal = lazy(() => import('./qr/QrCodeModal'));
 const AttachClientsModal = lazy(() => import('./clients/AttachClientsModal'));
 const AttachExistingClientsModal = lazy(() => import('./clients/AttachExistingClientsModal'));
 const DetachClientsModal = lazy(() => import('./clients/DetachClientsModal'));
@@ -58,7 +59,6 @@ const AddClientsToGroupModal = lazy(() => import('./clients/AddClientsToGroupMod
 type RowAction =
   | 'edit'
   | 'showInfo'
-  | 'qrcode'
   | 'export'
   | 'subs'
   | 'clipboard'
@@ -112,6 +112,16 @@ export default function InboundsPage() {
   }, [messageApi]);
 
   const { nodes: nodesList, fetched: nodesFetched } = useNodesQuery();
+  // MTProto share links are generated from this list, so an empty one must mean
+  // "no hosts" and not "not loaded yet" — the gate below waits for it.
+  const {
+    hosts,
+    fetched: hostsFetched,
+    fetchError: hostsFetchError,
+    refetch: refetchHosts,
+  } = useHostsQuery();
+  // A background refetch that fails while rows are still cached is not fatal.
+  const hostsError = hosts.length > 0 ? '' : hostsFetchError;
   const nodesById = useMemo(() => {
     const map = new Map<number, ReturnType<typeof useNodesQuery>['nodes'][number]>();
     for (const n of nodesList || []) map.set(n.id, n);
@@ -154,9 +164,6 @@ export default function InboundsPage() {
   const [infoOpen, setInfoOpen] = useState(false);
   const [infoDbInbound, setInfoDbInbound] = useState<DBInbound | null>(null);
   const [infoClientIndex, setInfoClientIndex] = useState(0);
-
-  const [qrOpen, setQrOpen] = useState(false);
-  const [qrDbInbound, setQrDbInbound] = useState<DBInbound | null>(null);
 
   const [attachOpen, setAttachOpen] = useState(false);
   const [attachSource, setAttachSource] = useState<DBInbound | null>(null);
@@ -201,7 +208,6 @@ export default function InboundsPage() {
     () => hostOverrideFor(infoDbInbound),
     [infoDbInbound, hostOverrideFor],
   );
-  const qrNodeAddress = useMemo(() => hostOverrideFor(qrDbInbound), [qrDbInbound, hostOverrideFor]);
 
   const openText = useCallback(
     (opts: {
@@ -288,6 +294,7 @@ export default function InboundsPage() {
       if (!dbInbound?.listen?.startsWith?.('@')) return dbInbound;
       for (const candidate of dbInbounds) {
         if (candidate.id === dbInbound.id) continue;
+        if ((candidate.nodeId ?? 0) !== (dbInbound.nodeId ?? 0)) continue;
         if (!['trojan', 'vless'].includes(candidate.protocol)) continue;
         const candStream = coerceInboundJsonField(candidate.streamSettings) as { network?: string };
         if (candStream.network !== 'tcp') continue;
@@ -314,6 +321,7 @@ export default function InboundsPage() {
       switch (dbInbound.protocol) {
         case 'trojan':
         case 'shadowsocks':
+        case 'masque':
           return c.password === client.password && c.email === client.email;
         default:
           return c.id === client.id && c.email === client.email;
@@ -325,11 +333,19 @@ export default function InboundsPage() {
   const exportInboundLinks = useCallback(
     (dbInbound: DBInbound) => {
       const projected = checkFallback(dbInbound);
+      const hostOverride = hostOverrideFor(dbInbound);
+      const fallbackHostname = preferPublicHost(window.location.hostname, subSettings.publicHost);
       const genInput = {
-        inbound: inboundFromDb(projected),
+        inbound: withHostEndpoints(
+          inboundFromDb(projected),
+          dbInbound.id,
+          hosts,
+          hostOverride,
+          fallbackHostname,
+        ),
         remark: projected.remark,
-        hostOverride: hostOverrideFor(dbInbound),
-        fallbackHostname: preferPublicHost(window.location.hostname, subSettings.publicHost),
+        hostOverride,
+        fallbackHostname,
       };
       const content = genInboundLinks(genInput);
       const tabs: TextModalTab[] | undefined = projected.isWireguard
@@ -358,7 +374,7 @@ export default function InboundsPage() {
         tabs,
       });
     },
-    [checkFallback, hostOverrideFor, subSettings.publicHost, openText, t],
+    [checkFallback, hostOverrideFor, hosts, subSettings.publicHost, openText, t],
   );
 
   const exportInboundClipboard = useCallback(
@@ -616,7 +632,6 @@ export default function InboundsPage() {
       const hydratingKeys: RowAction[] = [
         'edit',
         'showInfo',
-        'qrcode',
         'export',
         'subs',
         'clipboard',
@@ -637,10 +652,6 @@ export default function InboundsPage() {
           setInfoDbInbound(checkFallback(target));
           setInfoClientIndex(findClientIndex(target, null));
           setInfoOpen(true);
-          break;
-        case 'qrcode':
-          setQrDbInbound(checkFallback(target));
-          setQrOpen(true);
           break;
         case 'export':
           exportInboundLinks(target);
@@ -708,16 +719,28 @@ export default function InboundsPage() {
 
         <Layout className="content-shell">
           <Layout.Content id="content-layout" className="content-area">
-            <Spin spinning={!fetched} delay={200} description={t('loading')} size="large">
-              {!fetched ? (
+            <Spin
+              aria-live="off"
+              spinning={!fetched || !hostsFetched}
+              delay={200}
+              description={t('loading')}
+              size="large"
+            >
+              {!fetched || !hostsFetched ? (
                 <div className="loading-spacer" />
-              ) : fetchError ? (
+              ) : fetchError || hostsError ? (
                 <Result
                   status="error"
                   title={t('somethingWentWrong')}
-                  subTitle={fetchError}
+                  subTitle={fetchError || hostsError}
                   extra={
-                    <Button type="primary" onClick={refresh}>
+                    <Button
+                      type="primary"
+                      onClick={() => {
+                        void refresh();
+                        void refetchHosts();
+                      }}
+                    >
                       {t('refresh')}
                     </Button>
                   }
@@ -733,9 +756,11 @@ export default function InboundsPage() {
                             value={0}
                             formatter={() => (
                               <span>
-                                <ArrowUpOutlined /> {SizeFormatter.sizeFormat(totals.up)}
+                                <ArrowUpOutlined aria-hidden />{' '}
+                                {SizeFormatter.sizeFormat(totals.up)}
                                 {' / '}
-                                <ArrowDownOutlined /> {SizeFormatter.sizeFormat(totals.down)}
+                                <ArrowDownOutlined aria-hidden />{' '}
+                                {SizeFormatter.sizeFormat(totals.down)}
                               </span>
                             )}
                           />
@@ -744,14 +769,14 @@ export default function InboundsPage() {
                           <Statistic
                             title={t('pages.inbounds.totalUsage')}
                             value={SizeFormatter.sizeFormat(totals.up + totals.down)}
-                            prefix={<PieChartOutlined />}
+                            prefix={<PieChartOutlined aria-hidden />}
                           />
                         </Col>
                         <Col xs={24} sm={24} md={8}>
                           <Statistic
                             title={t('pages.inbounds.inboundCount')}
                             value={String(dbInbounds.length)}
-                            prefix={<BarsOutlined />}
+                            prefix={<BarsOutlined aria-hidden />}
                           />
                         </Col>
                       </Row>
@@ -772,6 +797,7 @@ export default function InboundsPage() {
                       subEnable={subSettings.enable}
                       nodesById={nodesById}
                       hasActiveNode={showNodeInfo}
+                      hosts={hosts}
                       onAddInbound={onAddInbound}
                       onGeneralAction={onGeneralAction}
                       onRowAction={({ key, dbInbound }) =>
@@ -809,18 +835,9 @@ export default function InboundsPage() {
             ipLimitEnable={ipLimitEnable}
             tgBotEnable={tgBotEnable}
             subSettings={subSettings}
+            hosts={hosts}
             lastOnlineMap={lastOnlineMap}
             nodeAddress={infoNodeAddress}
-          />
-        </LazyMount>
-        <LazyMount when={qrOpen}>
-          <QrCodeModal
-            open={qrOpen}
-            onClose={() => setQrOpen(false)}
-            dbInbound={qrDbInbound}
-            client={null}
-            nodeAddress={qrNodeAddress}
-            subSettings={subSettings}
           />
         </LazyMount>
         <LazyMount when={attachOpen}>

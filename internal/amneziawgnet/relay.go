@@ -143,6 +143,10 @@ type socks5UDPSession struct {
 	udpConn *net.UDPConn
 }
 
+// Bounds dial plus the greeting/auth/associate reads: an accepted-but-silent
+// server otherwise parks Handle, and with it the tunnel's delivery path.
+var socks5AssociateTimeout = 5 * time.Second
+
 // newSocks5UDPSession performs the SOCKS5 greeting, username/password auth,
 // and UDP ASSOCIATE request/reply by hand: golang.org/x/net/proxy's SOCKS5
 // client (used by RelayTCP above) only implements CONNECT, and xray-core's
@@ -150,11 +154,13 @@ type socks5UDPSession struct {
 // types, not reusable as a standalone dialer -- so this is a small, direct,
 // from-the-RFC implementation rather than an existing library call.
 func newSocks5UDPSession(addr, user, password string) (*socks5UDPSession, error) {
-	dialer := net.Dialer{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(socks5AssociateTimeout)
+	dialer := net.Dialer{Deadline: deadline}
 	ctrl, err := dialer.DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("amneziawgnet: dial SOCKS5 control connection: %w", err)
 	}
+	_ = ctrl.SetDeadline(deadline)
 	if err := socks5Handshake(ctrl, user, password); err != nil {
 		ctrl.Close()
 		return nil, err
@@ -171,6 +177,7 @@ func newSocks5UDPSession(addr, user, password string) (*socks5UDPSession, error)
 		ctrl.Close()
 		return nil, err
 	}
+	_ = ctrl.SetDeadline(time.Time{})
 
 	udpConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(bind))
 	if err != nil {
@@ -379,11 +386,12 @@ type UDPRelay struct {
 	// session map: src.String() would allocate on every relayed datagram.
 	mu       sync.Mutex
 	sessions map[netip.AddrPort]*socks5UDPSession
+	slots    *peerSlots
 }
 
 // NewUDPRelay creates a UDPRelay for one embedded AmneziaWG Device's stack.
 func NewUDPRelay(relay SocksRelay, gstack *stack.Stack) *UDPRelay {
-	return &UDPRelay{relay: relay, gstack: gstack, sessions: map[netip.AddrPort]*socks5UDPSession{}}
+	return &UDPRelay{relay: relay, gstack: gstack, sessions: map[netip.AddrPort]*socks5UDPSession{}, slots: newPeerSlots(maxUDPSessionsPerPeer)}
 }
 
 // Handle relays one packet from src (the peer's tunnel-internal source) to
@@ -397,8 +405,12 @@ func (u *UDPRelay) Handle(src, dst netip.AddrPort, email string, payload []byte)
 	u.mu.Unlock()
 
 	if !ok {
+		if !u.slots.acquire(email) {
+			return
+		}
 		fresh, err := newSocks5UDPSession(u.relay.Addr, email, u.relay.Password)
 		if err != nil {
+			u.slots.release(email)
 			logger.Warningf("amneziawgnet: UDPRelay: SOCKS5 associate for %q: %v", email, err)
 			return
 		}
@@ -408,12 +420,16 @@ func (u *UDPRelay) Handle(src, dst netip.AddrPort, email string, payload []byte)
 		if existing, dup := u.sessions[src]; dup {
 			u.mu.Unlock()
 			fresh.Close()
+			u.slots.release(email)
 			sess = existing
 		} else {
 			u.sessions[src] = fresh
 			u.mu.Unlock()
 			sess = fresh
-			go u.pump(src, fresh)
+			go func() {
+				defer u.slots.release(email)
+				u.pump(src, fresh)
+			}()
 		}
 	}
 	if err := sess.sendTo(dst, payload); err != nil {
@@ -444,6 +460,19 @@ func (u *UDPRelay) pump(src netip.AddrPort, sess *socks5UDPSession) {
 		}
 		if err := WriteUDPReply(u.gstack, from, src, payload); err != nil {
 			logger.Warningf("amneziawgnet: UDPRelay: reply write: %v", err)
+		}
+	}
+}
+
+// CloseSessions tears down the sessions whose tunnel-internal source address
+// matches; pump retires each one's goroutine on the resulting read error.
+func (u *UDPRelay) CloseSessions(match func(netip.Addr) bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for k, s := range u.sessions {
+		if match(k.Addr()) {
+			s.Close()
+			delete(u.sessions, k)
 		}
 	}
 }

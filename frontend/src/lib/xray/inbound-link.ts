@@ -1,4 +1,6 @@
 import { Base64, Wireguard } from '@/utils';
+import { effectiveMtu } from '@/lib/xray/amneziawg-obfuscation';
+import { AmneziaWGKeepAliveRangeSchema } from '@/schemas/primitives/keepalive';
 
 import type { Inbound } from '@/schemas/api/inbound';
 import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
@@ -13,9 +15,13 @@ import type { FinalMaskStreamSettings } from '@/schemas/protocols/stream/finalma
 import type { XHttpStreamSettings } from '@/schemas/protocols/stream/xhttp';
 
 import { parseGeckoPacketSize } from '@/lib/xray/forms/transport/FinalMaskForm';
+import { UTLS_FINGERPRINT } from '@/schemas/primitives';
+import { hasWgQuickHook, joinConfLines } from './conf-lines';
 import { getHeaderValue } from './headers';
 import { canEnableTlsFlow } from './protocol-capabilities';
 import { deriveSpiderX } from './spider-x';
+import { vlessEncryptionAuthKind } from './vless-encryption';
+import { normalizeTuicCongestionController, resolveTuicServerSettings } from '@/lib/tuic';
 
 // Share-link generators. Each per-protocol fn takes a typed inbound plus
 // client overrides and returns a URL (or '' when the protocol doesn't
@@ -143,9 +149,53 @@ function hasShareableFinalMaskValue(value: unknown): boolean {
   return true;
 }
 
+function withLegacyFragmentRanges(finalmask: FinalMaskStreamSettings): FinalMaskStreamSettings {
+  // Stored rows reach here unparsed: dropEmptyFinalMask deletes an empty `tcp` on save.
+  if (!Array.isArray(finalmask.tcp)) return finalmask;
+  let changed = false;
+  const tcp = finalmask.tcp.map((mask) => {
+    if (mask.type !== 'fragment' || !mask.settings) return mask;
+
+    const settings = mask.settings;
+    const legacy: Record<string, unknown> = {};
+    if (settings.length === undefined && Array.isArray(settings.lengths)) {
+      const length = settings.lengths.at(-1);
+      if (typeof length === 'string' && length.trim().length > 0) legacy.length = length;
+    }
+    if (settings.delay === undefined && Array.isArray(settings.delays)) {
+      const delay = settings.delays.at(-1);
+      if (typeof delay === 'string' && delay.trim().length > 0) legacy.delay = delay;
+    }
+    if (Object.keys(legacy).length === 0) return mask;
+
+    changed = true;
+    return { ...mask, settings: { ...settings, ...legacy } };
+  });
+
+  return changed ? { ...finalmask, tcp } : finalmask;
+}
+
+// The "filter" mask (xray-core 26.10.21) screens the listener's source IPs, and a client core older
+// than it refuses the unknown type. Mirrors dropServerOnlyFinalMasks in internal/sub.
+function withoutServerOnlyMasks(finalmask: FinalMaskStreamSettings): FinalMaskStreamSettings {
+  const next: Record<string, unknown> = { ...finalmask };
+  let changed = false;
+  for (const layer of ['tcp', 'udp'] as const) {
+    const masks = finalmask[layer];
+    if (!Array.isArray(masks)) continue;
+    const kept = masks.filter((mask) => mask?.type !== 'filter');
+    if (kept.length === masks.length) continue;
+    changed = true;
+    if (kept.length > 0) next[layer] = kept;
+    else delete next[layer];
+  }
+  return changed ? (next as FinalMaskStreamSettings) : finalmask;
+}
+
 function serializeFinalMask(finalmask: FinalMaskStreamSettings | undefined): string {
   if (!finalmask) return '';
-  return hasShareableFinalMaskValue(finalmask) ? JSON.stringify(finalmask) : '';
+  const shareable = withLegacyFragmentRanges(withoutServerOnlyMasks(finalmask));
+  return hasShareableFinalMaskValue(shareable) ? JSON.stringify(shareable) : '';
 }
 
 function applyFinalMaskToObj(
@@ -164,6 +214,18 @@ function externalProxyAlpn(value: ExternalProxyEntry['alpn']): string {
 function externalProxyPins(value: ExternalProxyEntry['pinnedPeerCertSha256']): string {
   if (Array.isArray(value)) return value.filter(Boolean).join(',');
   return '';
+}
+
+// Xray drops cipherSuites under every uTLS fingerprint and reads an empty one as
+// chrome, so a link carrying cs must ask for unsafe; the sub server does the same.
+function pinUnsafeFingerprintForCipherSuites(
+  link: URLSearchParams | Record<string, unknown>,
+): void {
+  if (link instanceof URLSearchParams) {
+    if (link.get('cs') && !link.get('fp')) link.set('fp', UTLS_FINGERPRINT.UTLS_UNSAFE);
+  } else if (link.cs && !link.fp) {
+    link.fp = UTLS_FINGERPRINT.UTLS_UNSAFE;
+  }
 }
 
 function applyExternalProxyTLSObj(
@@ -186,6 +248,8 @@ function applyExternalProxyTLSObj(
   }
   if (externalProxy.echConfigList && externalProxy.echConfigList.length > 0)
     obj.ech = externalProxy.echConfigList;
+  if (externalProxy.cipherSuites && externalProxy.cipherSuites.length > 0)
+    obj.cs = externalProxy.cipherSuites;
 }
 
 export interface GenVmessLinkInput {
@@ -288,9 +352,13 @@ export function genVmessLink(input: GenVmessLinkInput): string {
     if (tlsSettings.settings.pinnedPeerCertSha256.length > 0) {
       obj.pcs = tlsSettings.settings.pinnedPeerCertSha256.join(',');
     }
+    if (tlsSettings.cipherSuites && tlsSettings.cipherSuites.length > 0) {
+      obj.cs = tlsSettings.cipherSuites;
+    }
   }
 
   applyExternalProxyTLSObj(externalProxy, obj, tls);
+  pinUnsafeFingerprintForCipherSuites(obj);
 
   return 'vmess://' + Base64.encode(JSON.stringify(obj, null, 2));
 }
@@ -345,6 +413,8 @@ function applyExternalProxyTLSParams(
   }
   if (externalProxy.echConfigList && externalProxy.echConfigList.length > 0)
     params.set('ech', externalProxy.echConfigList);
+  if (externalProxy.cipherSuites && externalProxy.cipherSuites.length > 0)
+    params.set('cs', externalProxy.cipherSuites);
 }
 
 export interface GenVlessLinkInput {
@@ -448,10 +518,14 @@ export function genVlessLink(input: GenVlessLinkInput): string {
       if (tls.settings.pinnedPeerCertSha256.length > 0) {
         params.set('pcs', tls.settings.pinnedPeerCertSha256.join(','));
       }
+      if (tls.cipherSuites && tls.cipherSuites.length > 0) {
+        params.set('cs', tls.cipherSuites);
+      }
     }
     applyExternalProxyTLSParams(externalProxy, params, security);
   } else if (security === 'reality') {
     params.set('security', 'reality');
+    params.set('support-x25519mlkem768', 'true');
     if (stream.security === 'reality') {
       const reality = stream.realitySettings;
       params.set('pbk', reality.settings.publicKey);
@@ -472,10 +546,8 @@ export function genVlessLink(input: GenVlessLinkInput): string {
     params.set('security', 'none');
   }
 
-  // XTLS Vision flow: TCP over tls/reality (classic) or XHTTP+vlessenc (the
-  // VLESS-level encryption stands in for transport TLS). Mirrors the backend's
-  // vlessFlowAllowed and the form's flow-field gating so panel link, share
-  // link and subscription agree.
+  // Same gate as the backend's vlessFlowAllowed and the form's flow field, so the
+  // panel link, share link and subscription agree.
   if (
     flow.length > 0 &&
     canEnableTlsFlow({
@@ -487,6 +559,7 @@ export function genVlessLink(input: GenVlessLinkInput): string {
     params.set('flow', flow);
   }
 
+  pinUnsafeFingerprintForCipherSuites(params);
   const url = new URL(
     `vless://${applyVlessRoute(clientId, externalProxy?.vlessRoute)}@${formatUrlHost(address)}:${port}`,
   );
@@ -553,6 +626,9 @@ function writeTlsParams(
   }
   if (tls.settings.pinnedPeerCertSha256.length > 0) {
     params.set('pcs', tls.settings.pinnedPeerCertSha256.join(','));
+  }
+  if (tls.cipherSuites && tls.cipherSuites.length > 0) {
+    params.set('cs', tls.cipherSuites);
   }
 }
 
@@ -627,6 +703,7 @@ export function genTrojanLink(input: GenTrojanLinkInput): string {
     params.set('security', 'none');
   }
 
+  pinUnsafeFingerprintForCipherSuites(params);
   const url = new URL(
     `trojan://${encodeURIComponent(clientPassword)}@${formatUrlHost(address)}:${port}`,
   );
@@ -645,13 +722,8 @@ export interface GenShadowsocksLinkInput {
   externalProxy?: ExternalProxyEntry | null;
 }
 
-// Shadowsocks 2022 share link. The userinfo portion is base64(method:pw)
-// for single-user and base64(method:settingsPw:clientPw) for multi-user
-// 2022-blake3. Legacy SS (non-2022) leaves the password out of the
-// userinfo entirely — matches the legacy class's password-array logic.
-// Note: legacy `isSSMultiUser` returns true for everything except
-// 2022-blake3-chacha20-poly1305 (a curious classification, but we
-// preserve it for byte-stable parity).
+// Shadowsocks share link: base64(method:clientPw) for legacy SS, and
+// percent-encoded method:serverPw:clientPw for 2022-blake3 (SIP022).
 export function genShadowsocksLink(input: GenShadowsocksLinkInput): string {
   const {
     inbound,
@@ -693,11 +765,11 @@ export function genShadowsocksLink(input: GenShadowsocksLinkInput): string {
     params.set('plugin', `obfs-local;obfs=http;obfs-host=${host}`);
   }
 
+  pinUnsafeFingerprintForCipherSuites(params);
   const isSS2022 = settings.method.substring(0, 4) === '2022';
-  const isSSMultiUser = settings.method !== '2022-blake3-chacha20-poly1305';
   const passwords: string[] = [];
   if (isSS2022) passwords.push(settings.password);
-  if (isSSMultiUser) passwords.push(clientPassword);
+  passwords.push(clientPassword);
 
   if (isSS2022) {
     // SIP022 (2022-blake3-*) forbids base64 userinfo: method and each key are
@@ -748,6 +820,18 @@ function hysteriaPinHex(pin: string): string {
   } catch {
     return pin;
   }
+}
+
+// Hysteria2 hop range advertised as `mport`. xray-core 26.9.9 moved hopping
+// from finalmask.quicParams.udpHop to a 'udphop' UDP mask; inbounds stored
+// before the upgrade still carry the old key.
+function udpHopPorts(stream: NonNullable<Inbound['streamSettings']>): string {
+  for (const mask of stream.finalmask?.udp ?? []) {
+    if (mask.type !== 'udphop') continue;
+    const ports = mask.settings?.remotePorts;
+    if (typeof ports === 'string' && ports.trim().length > 0) return ports.trim();
+  }
+  return stream.finalmask?.quicParams?.udpHop?.ports?.trim() ?? '';
 }
 
 // Hysteria share link: hysteria2://<auth>@<host>:<port>?<query>#<remark>.
@@ -816,7 +900,7 @@ export function genHysteriaLink(input: GenHysteriaLinkInput): string {
     }
   }
 
-  const hopPorts = stream.finalmask?.quicParams?.udpHop?.ports?.trim() ?? '';
+  const hopPorts = udpHopPorts(stream);
   if (hopPorts.length > 0) {
     params.set('mport', hopPorts);
   }
@@ -847,6 +931,71 @@ export function genMtprotoLink(input: GenMtprotoLinkInput): string {
   url.searchParams.set('server', address);
   url.searchParams.set('port', String(port));
   url.searchParams.set('secret', clientSecret);
+  return url.toString();
+}
+
+export interface GenTuicLinkInput {
+  inbound: Inbound;
+  address: string;
+  port?: number;
+  remark?: string;
+  clientUuid?: string;
+  clientPassword?: string;
+  externalProxy?: ExternalProxyEntry | null;
+}
+
+export function genTuicLink(input: GenTuicLinkInput): string {
+  const {
+    inbound,
+    address,
+    port = inbound.port,
+    remark = '',
+    clientUuid = '',
+    clientPassword = '',
+    externalProxy = null,
+  } = input;
+  if (!clientUuid || !clientPassword) return '';
+
+  const rawSettings = inbound.settings as Record<string, unknown>;
+  const server = resolveTuicServerSettings(rawSettings);
+  const host = formatUrlHost(externalProxy?.dest || address);
+  const targetPort = externalProxy?.port || port;
+
+  const url = new URL(
+    `tuic://${encodeURIComponent(clientUuid)}:${encodeURIComponent(clientPassword)}@${host}:${targetPort}`,
+  );
+  const cc = normalizeTuicCongestionController(
+    server.congestion_control ?? rawSettings.congestion_control,
+  );
+  url.searchParams.set('congestion_control', cc);
+
+  const epAlpn = externalProxyAlpn(externalProxy?.alpn);
+  const alpn =
+    epAlpn ||
+    (Array.isArray(server.alpn) && server.alpn.length > 0
+      ? (server.alpn as string[]).join(',')
+      : null) ||
+    (Array.isArray(rawSettings.alpn) && rawSettings.alpn.length > 0
+      ? (rawSettings.alpn as string[]).join(',')
+      : null) ||
+    'h3,spdy/3.1';
+  url.searchParams.set('alpn', alpn);
+
+  const sni = externalProxy?.sni || (server.sni as string) || (rawSettings.sni as string);
+  if (sni) {
+    url.searchParams.set('sni', sni);
+  }
+  const udpRelay =
+    (server.udp_relay_mode as string) || (rawSettings.udp_relay_mode as string) || 'native';
+  url.searchParams.set('udp_relay_mode', udpRelay);
+
+  const allowInsecure = externalProxy?.allowInsecure ? '1' : '0';
+  url.searchParams.set('allow_insecure', allowInsecure);
+
+  if (remark) {
+    url.hash = encodeURIComponent(remark);
+  }
+
   return url.toString();
 }
 
@@ -899,25 +1048,24 @@ export function genWireguardConfig(input: GenWireguardLinkInput): string {
   const pubKey =
     settings.secretKey.length > 0 ? Wireguard.generateKeypair(settings.secretKey).publicKey : '';
 
-  let txt = `[Interface]\n`;
-  txt += `PrivateKey = ${peer.privateKey ?? ''}\n`;
-  txt += `Address = ${peer.allowedIPs.join(', ')}\n`;
-  txt += `DNS = ${settings.dns || '1.1.1.1, 1.0.0.1'}\n`;
+  const lines = [
+    '[Interface]',
+    `PrivateKey = ${peer.privateKey ?? ''}`,
+    `Address = ${peer.allowedIPs.join(', ')}`,
+    `DNS = ${settings.dns || '1.1.1.1, 1.0.0.1'}`,
+  ];
   if (typeof settings.mtu === 'number' && settings.mtu > 0) {
-    txt += `MTU = ${settings.mtu}\n`;
+    lines.push(`MTU = ${settings.mtu}`);
   }
-  txt += `\n# ${remark}\n`;
-  txt += `[Peer]\n`;
-  txt += `PublicKey = ${pubKey}\n`;
-  txt += `AllowedIPs = 0.0.0.0/0, ::/0\n`;
-  txt += `Endpoint = ${address}:${port}`;
+  lines.push('', `# ${remark}`, '[Peer]', `PublicKey = ${pubKey}`, 'AllowedIPs = 0.0.0.0/0, ::/0');
+  lines.push(`Endpoint = ${address}:${port}`);
   if (peer.preSharedKey && peer.preSharedKey.length > 0) {
-    txt += `\nPresharedKey = ${peer.preSharedKey}`;
+    lines.push(`PresharedKey = ${peer.preSharedKey}`);
   }
   if (typeof peer.keepAlive === 'number' && peer.keepAlive > 0) {
-    txt += `\nPersistentKeepalive = ${peer.keepAlive}\n`;
+    lines.push(`PersistentKeepalive = ${peer.keepAlive}`, '');
   }
-  return txt;
+  return joinConfLines(lines);
 }
 
 // Shared input shape for both the per-client vpn:// link and .conf
@@ -969,41 +1117,25 @@ export function genAmneziaWGConfig(input: GenAmneziaWGLinkInput): string {
   if (!client) return '';
   const server = settings.server;
 
-  // These land unescaped in the .conf; a newline would inject a config line
-  // (e.g. a rogue PostUp) — same guard as the panel's other two emitters.
-  for (const v of [
-    client.privateKey ?? '',
-    server.primaryDns ?? '',
-    server.secondaryDns ?? '',
-    remark,
-  ]) {
-    if (/[\r\n]/.test(v)) return '';
-  }
-
-  let txt = `[Interface]\n`;
-  txt += `PrivateKey = ${client.privateKey ?? ''}\n`;
-  txt += `Address = ${(client.allowedIPs ?? []).join(', ')}\n`;
+  const lines = [
+    '[Interface]',
+    `PrivateKey = ${client.privateKey ?? ''}`,
+    `Address = ${(client.allowedIPs ?? []).join(', ')}`,
+  ];
   const dns = [server.primaryDns, server.secondaryDns].filter((v) => !!v && v.trim() !== '');
-  if (dns.length > 0) txt += `DNS = ${dns.join(', ')}\n`;
-  if (typeof server.mtu === 'number' && server.mtu > 0) {
-    txt += `MTU = ${server.mtu}\n`;
-  }
-  txt += `Jc = ${server.jc}\n`;
-  txt += `Jmin = ${server.jmin}\n`;
-  txt += `Jmax = ${server.jmax}\n`;
-  txt += `S1 = ${server.s1}\n`;
-  txt += `S2 = ${server.s2}\n`;
-  if (server.s3) txt += `S3 = ${server.s3}\n`;
-  if (server.s4) txt += `S4 = ${server.s4}\n`;
-  txt += `${amneziaWGHLine('H1', server.h1, '1')}\n`;
-  txt += `${amneziaWGHLine('H2', server.h2, '2')}\n`;
-  txt += `${amneziaWGHLine('H3', server.h3, '3')}\n`;
-  txt += `${amneziaWGHLine('H4', server.h4, '4')}\n`;
-  if (server.i1) txt += `I1 = ${server.i1}\n`;
-  if (server.i2) txt += `I2 = ${server.i2}\n`;
-  if (server.i3) txt += `I3 = ${server.i3}\n`;
-  if (server.i4) txt += `I4 = ${server.i4}\n`;
-  if (server.i5) txt += `I5 = ${server.i5}\n`;
+  if (dns.length > 0) lines.push(`DNS = ${dns.join(', ')}`);
+  lines.push(`MTU = ${effectiveMtu(server.mtu, server.s4)}`);
+  lines.push(`Jc = ${server.jc}`, `Jmin = ${server.jmin}`, `Jmax = ${server.jmax}`);
+  lines.push(`S1 = ${server.s1}`, `S2 = ${server.s2}`);
+  if (server.s3) lines.push(`S3 = ${server.s3}`);
+  if (server.s4) lines.push(`S4 = ${server.s4}`);
+  lines.push(amneziaWGHLine('H1', server.h1, '1'), amneziaWGHLine('H2', server.h2, '2'));
+  lines.push(amneziaWGHLine('H3', server.h3, '3'), amneziaWGHLine('H4', server.h4, '4'));
+  if (server.i1) lines.push(`I1 = ${server.i1}`);
+  if (server.i2) lines.push(`I2 = ${server.i2}`);
+  if (server.i3) lines.push(`I3 = ${server.i3}`);
+  if (server.i4) lines.push(`I4 = ${server.i4}`);
+  if (server.i5) lines.push(`I5 = ${server.i5}`);
   const optional31: Array<[string, string | undefined]> = [
     ['HeaderProtectionKey', server.headerProtectionKey],
     ['ContentPaddingAddition', server.contentPaddingAddition],
@@ -1014,25 +1146,25 @@ export function genAmneziaWGConfig(input: GenAmneziaWGLinkInput): string {
     ['MaxHandshakeAttempts', server.maxHandshakeAttempts],
   ];
   for (const [key, value] of optional31) {
-    if (value && value.trim() !== '') txt += `${key} = ${value}\n`;
+    if (value && value.trim() !== '') lines.push(`${key} = ${value}`);
   }
-  if (server.randomTrailers) txt += `RandomTrailers = on\n`;
-  if (server.disableCookies) txt += `DisableCookies = on\n`;
+  if (server.randomTrailers) lines.push('RandomTrailers = on');
+  if (server.disableCookies) lines.push('DisableCookies = on');
   // Peer field order follows wg-quick(8) and the panel's other two AmneziaWG
   // emitters (amneziaWGConfigText in Go, buildAmneziaWGClientConfig); all three
   // are independent implementations and must not drift apart.
-  txt += `\n# ${remark}\n`;
-  txt += `[Peer]\n`;
-  txt += `PublicKey = ${server.publicKey ?? ''}\n`;
+  lines.push('', `# ${remark}`, '[Peer]', `PublicKey = ${server.publicKey ?? ''}`);
   if (client.preSharedKey && client.preSharedKey.length > 0) {
-    txt += `PresharedKey = ${client.preSharedKey}\n`;
+    lines.push(`PresharedKey = ${client.preSharedKey}`);
   }
-  txt += `AllowedIPs = 0.0.0.0/0, ::/0\n`;
-  txt += `Endpoint = ${address}:${port}`;
-  if (typeof client.keepAlive === 'number' && client.keepAlive > 0) {
-    txt += `\nPersistentKeepalive = ${client.keepAlive}`;
+  lines.push('AllowedIPs = 0.0.0.0/0, ::/0', `Endpoint = ${address}:${port}`);
+  if (typeof client.keepAlive === 'string') {
+    if (!AmneziaWGKeepAliveRangeSchema.safeParse(client.keepAlive).success) return '';
+    lines.push(`PersistentKeepalive = ${client.keepAlive}`);
+  } else if (typeof client.keepAlive === 'number' && client.keepAlive > 0) {
+    lines.push(`PersistentKeepalive = ${client.keepAlive}`);
   }
-  return txt;
+  return joinConfLines(lines);
 }
 
 export interface GenAmneziaWGFanoutInput {
@@ -1042,44 +1174,43 @@ export interface GenAmneziaWGFanoutInput {
   fallbackHostname: string;
 }
 
-export function genAmneziaWGLinks(input: GenAmneziaWGFanoutInput): string {
+function amneziaWGFanout(
+  input: GenAmneziaWGFanoutInput,
+  render: (input: GenAmneziaWGLinkInput) => string,
+): string[][] {
   const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
-  if (inbound.protocol !== 'amneziawg') return '';
-  const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
-  const sep = '-';
+  if (inbound.protocol !== 'amneziawg') return [];
+  const endpoints = tunnelEndpoints(inbound, resolveAddr(inbound, hostOverride, fallbackHostname));
   const settings = inbound.settings as AmneziawgInboundSettings;
   const clients = settings.clients ?? [];
-  return clients
-    .map((c, i) =>
-      genAmneziaWGLink({
+  return clients.map((c, i) =>
+    endpoints.map((e) =>
+      render({
         settings,
-        address: addr,
-        port: inbound.port,
-        remark: `${remark}${sep}${i + 1}${wgPeerCommentSuffix(c)}`,
+        address: e.address,
+        port: e.port,
+        remark: tunnelPeerRemark(remark, e.remark, i, c),
         peerIndex: i,
       }),
-    )
-    .join('\r\n');
+    ),
+  );
+}
+
+// Per-peer lists with one entry per advertised endpoint (Host), peer-major.
+export function genAmneziaWGPeerLinks(input: GenAmneziaWGFanoutInput): string[][] {
+  return amneziaWGFanout(input, genAmneziaWGLink);
+}
+
+export function genAmneziaWGPeerConfigs(input: GenAmneziaWGFanoutInput): string[][] {
+  return amneziaWGFanout(input, genAmneziaWGConfig);
+}
+
+export function genAmneziaWGLinks(input: GenAmneziaWGFanoutInput): string {
+  return genAmneziaWGPeerLinks(input).flat().join('\r\n');
 }
 
 export function genAmneziaWGConfigs(input: GenAmneziaWGFanoutInput): string {
-  const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
-  if (inbound.protocol !== 'amneziawg') return '';
-  const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
-  const sep = '-';
-  const settings = inbound.settings as AmneziawgInboundSettings;
-  const clients = settings.clients ?? [];
-  return clients
-    .map((c, i) =>
-      genAmneziaWGConfig({
-        settings,
-        address: addr,
-        port: inbound.port,
-        remark: `${remark}${sep}${i + 1}${wgPeerCommentSuffix(c)}`,
-        peerIndex: i,
-      }),
-    )
-    .join('\r\n');
+  return genAmneziaWGPeerConfigs(input).flat().join('\r\n');
 }
 
 export function wireguardConfigFromLink(link: string, fallbackRemark = ''): string {
@@ -1139,7 +1270,7 @@ export function wireguardConfigFromLink(link: string, fallbackRemark = ''): stri
   if (psk) lines.push(`PresharedKey = ${psk}`);
   lines.push(`AllowedIPs = ${allowedIPs}`, `Endpoint = ${endpoint}`);
   if (keepAlive && Number(keepAlive) > 0) lines.push(`PersistentKeepalive = ${keepAlive}`);
-  return lines.join('\n');
+  return joinConfLines(lines);
 }
 
 // Reverse of toBase64Url above -- recovers a vpn:// link's plain .conf
@@ -1164,7 +1295,8 @@ export function amneziawgConfigFromLink(link: string): string {
   const trimmed = link.trim();
   if (!trimmed.startsWith('vpn://')) return '';
   try {
-    return fromBase64Url(trimmed.slice('vpn://'.length));
+    const conf = fromBase64Url(trimmed.slice('vpn://'.length));
+    return hasWgQuickHook(conf) ? '' : conf;
   } catch {
     return '';
   }
@@ -1288,13 +1420,11 @@ export function preferPublicHost(browserHost: string, publicHost: string): strin
   return publicHost && isLoopbackHost(browserHost) ? publicHost : browserHost;
 }
 
-// Returns the client array for protocols that have one. SS returns its
-// clients only in 2022-blake3 multi-user mode (matches the legacy
-// `this.clients` getter, which used isSSMultiUser to gate). Returns null
-// for SS single-user, http, mixed, tunnel, wireguard, hysteria2-without-
-// clients, and any protocol without a clients array.
+// Returns the client array for protocols that have one; null for http, mixed,
+// tunnel, wireguard, hysteria2-without-clients, and any protocol without one.
 type ClientShape = {
   id?: string;
+  uuid?: string;
   security?: VmessSecurity;
   flow?: VlessClient['flow'];
   password?: string;
@@ -1322,10 +1452,10 @@ export function getInboundClients(inbound: Inbound): ClientShape[] | null {
       return (inbound.settings.clients ?? []) as ClientShape[];
     case 'mtproto':
       return (inbound.settings.clients ?? []) as ClientShape[];
-    case 'shadowsocks': {
-      const isMultiUser = inbound.settings.method !== '2022-blake3-chacha20-poly1305';
-      return isMultiUser ? ((inbound.settings.clients ?? []) as ClientShape[]) : null;
-    }
+    case 'tuic':
+      return (inbound.settings.clients ?? []) as ClientShape[];
+    case 'shadowsocks':
+      return (inbound.settings.clients ?? []) as ClientShape[];
     default:
       return null;
   }
@@ -1339,6 +1469,11 @@ export interface GenLinkInput {
   remark?: string;
   client: ClientShape;
   externalProxy?: ExternalProxyEntry | null;
+}
+
+// XDRIVE has no link format; a link carrying its storage secrets would leak them.
+function hasNoLinkFormat(inbound: Inbound): boolean {
+  return inbound.streamSettings?.network === 'xdrive';
 }
 
 // Per-protocol dispatcher matching the legacy `genLink` switch. Returns
@@ -1355,6 +1490,7 @@ export function genLink(input: GenLinkInput): string {
     client,
     externalProxy = null,
   } = input;
+  if (hasNoLinkFormat(inbound)) return '';
   switch (inbound.protocol) {
     case 'vmess':
       return genVmessLink({
@@ -1379,18 +1515,16 @@ export function genLink(input: GenLinkInput): string {
         flow: client.flow,
         externalProxy,
       });
-    case 'shadowsocks': {
-      const isMultiUser = inbound.settings.method !== '2022-blake3-chacha20-poly1305';
+    case 'shadowsocks':
       return genShadowsocksLink({
         inbound,
         address,
         port,
         forceTls,
         remark,
-        clientPassword: isMultiUser ? (client.password ?? '') : '',
+        clientPassword: client.password ?? '',
         externalProxy,
       });
-    }
     case 'trojan':
       return genTrojanLink({
         inbound,
@@ -1413,6 +1547,16 @@ export function genLink(input: GenLinkInput): string {
       });
     case 'mtproto':
       return genMtprotoLink({ inbound, address, port, clientSecret: client.secret ?? '' });
+    case 'tuic':
+      return genTuicLink({
+        inbound,
+        address,
+        port,
+        remark,
+        clientUuid: client.uuid ?? client.id ?? '',
+        clientPassword: client.password ?? '',
+        externalProxy,
+      });
     default:
       return '';
   }
@@ -1485,6 +1629,7 @@ export interface GenInboundLinksInput {
 // other clientless protocols (http, mixed, tunnel).
 export function genInboundLinks(input: GenInboundLinksInput): string {
   const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
+  if (hasNoLinkFormat(inbound)) return '';
   const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
   const clients = getInboundClients(inbound);
   if (clients) {
@@ -1536,46 +1681,67 @@ function wgRenderPeers(settings: WireguardInboundSettings): WireguardInboundPeer
   return settings.peers;
 }
 
-export function genWireguardLinks(input: GenWireguardFanoutInput): string {
+// Hosts reach wireguard/amneziawg as externalProxy entries (withHostEndpoints);
+// with none, every peer is advertised on the inbound's own address.
+function tunnelEndpoints(
+  inbound: Inbound,
+  addr: string,
+): Array<{ address: string; port: number; remark: string }> {
+  const externals = inbound.streamSettings?.externalProxy;
+  if (Array.isArray(externals) && externals.length > 0) {
+    return externals.map((ep) => ({ address: ep.dest, port: ep.port, remark: ep.remark ?? '' }));
+  }
+  return [{ address: addr, port: inbound.port, remark: '' }];
+}
+
+function tunnelPeerRemark(
+  remark: string,
+  endpointRemark: string,
+  index: number,
+  peer: unknown,
+): string {
+  const base = [remark, endpointRemark].filter((x) => x.length > 0).join('-');
+  return `${base}-${index + 1}${wgPeerCommentSuffix(peer)}`;
+}
+
+function wireguardFanout(
+  input: GenWireguardFanoutInput,
+  render: (input: GenWireguardLinkInput) => string,
+): string[][] {
   const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
-  if (inbound.protocol !== 'wireguard') return '';
-  const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
-  const sep = '-';
+  if (inbound.protocol !== 'wireguard') return [];
+  const endpoints = tunnelEndpoints(inbound, resolveAddr(inbound, hostOverride, fallbackHostname));
   const baseSettings = inbound.settings as WireguardInboundSettings;
   const peers = wgRenderPeers(baseSettings);
   const settings: WireguardInboundSettings = { ...baseSettings, peers };
-  return peers
-    .map((p, i) =>
-      genWireguardLink({
+  return peers.map((p, i) =>
+    endpoints.map((e) =>
+      render({
         settings,
-        address: addr,
-        port: inbound.port,
-        remark: `${remark}${sep}${i + 1}${wgPeerCommentSuffix(p)}`,
+        address: e.address,
+        port: e.port,
+        remark: tunnelPeerRemark(remark, e.remark, i, p),
         peerIndex: i,
       }),
-    )
-    .join('\r\n');
+    ),
+  );
+}
+
+// Per-peer lists with one entry per advertised endpoint (Host), peer-major.
+export function genWireguardPeerLinks(input: GenWireguardFanoutInput): string[][] {
+  return wireguardFanout(input, genWireguardLink);
+}
+
+export function genWireguardPeerConfigs(input: GenWireguardFanoutInput): string[][] {
+  return wireguardFanout(input, genWireguardConfig);
+}
+
+export function genWireguardLinks(input: GenWireguardFanoutInput): string {
+  return genWireguardPeerLinks(input).flat().join('\r\n');
 }
 
 export function genWireguardConfigs(input: GenWireguardFanoutInput): string {
-  const { inbound, remark = '', hostOverride = '', fallbackHostname } = input;
-  if (inbound.protocol !== 'wireguard') return '';
-  const addr = resolveAddr(inbound, hostOverride, fallbackHostname);
-  const sep = '-';
-  const baseSettings = inbound.settings as WireguardInboundSettings;
-  const peers = wgRenderPeers(baseSettings);
-  const settings: WireguardInboundSettings = { ...baseSettings, peers };
-  return peers
-    .map((p, i) =>
-      genWireguardConfig({
-        settings,
-        address: addr,
-        port: inbound.port,
-        remark: `${remark}${sep}${i + 1}${wgPeerCommentSuffix(p)}`,
-        peerIndex: i,
-      }),
-    )
-    .join('\r\n');
+  return genWireguardPeerConfigs(input).flat().join('\r\n');
 }
 
 // Peer comments (#5168) are panel-side annotations; when present they ride
@@ -1585,9 +1751,13 @@ function wgPeerCommentSuffix(peer: unknown): string {
   return typeof comment === 'string' && comment.trim() !== '' ? ` (${comment.trim()})` : '';
 }
 
+// Only the post-quantum key payloads outgrow a QR; the REALITY ML-KEM hint and the
+// mlkem768x25519plus prefix of an X25519-authenticated encryption do not (#6730).
 export function isPostQuantumLink(link: string): boolean {
-  if (/[?&]pqv=/.test(link)) return true;
-  if (link.includes('mlkem768') || link.includes('mldsa65')) return true;
-  if (link.includes('ML-KEM-768')) return true;
-  return false;
+  const withoutRemark = link.split('#', 1)[0];
+  const queryStart = withoutRemark.indexOf('?');
+  if (queryStart < 0) return false;
+  const params = new URLSearchParams(withoutRemark.slice(queryStart + 1));
+  if (params.get('pqv')) return true;
+  return vlessEncryptionAuthKind(params.get('encryption') ?? '')?.startsWith('mlkem768') ?? false;
 }

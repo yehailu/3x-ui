@@ -1,13 +1,16 @@
 package service
 
 import (
+	"cmp"
 	"encoding/json"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -18,9 +21,7 @@ import (
 // observations under its panelGuid, and the master merges every node's
 // guid-keyed report — never mixing in IPs a parent pushed down.
 
-// mergeModelClientIpEntries unions old and incoming observations, drops anything
-// older than cutoff, keeps the newest timestamp per IP, and sorts newest-first.
-// It mirrors mergeClientIpEntries but operates on the exported wire type.
+// Attribution excludes empty addresses and keeps each fresh IP's maximum timestamp.
 func mergeModelClientIpEntries(old, incoming []model.ClientIpEntry, cutoff int64) []model.ClientIpEntry {
 	ipMap := make(map[string]int64, len(old)+len(incoming))
 	for _, e := range old {
@@ -41,13 +42,11 @@ func mergeModelClientIpEntries(old, incoming []model.ClientIpEntry, cutoff int64
 	for ip, ts := range ipMap {
 		out = append(out, model.ClientIpEntry{IP: ip, Timestamp: ts})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp > out[j].Timestamp })
 	return out
 }
 
-// upsertNodeClientIps folds a guid's per-email observations into NodeClientIp,
-// merging with whatever is already stored for that (guid, email) and dropping
-// stale entries. Empty merged results delete the row so the table stays bounded.
+// upsertNodeClientIps merges fresh observations per (guid, email).
+// Empty results delete attribution instead of retaining expired rows.
 func upsertNodeClientIps(guid string, perEmail map[string][]model.ClientIpEntry) error {
 	if guid == "" || len(perEmail) == 0 {
 		return nil
@@ -99,8 +98,11 @@ func upsertNodeClientIps(guid string, perEmail map[string][]model.ClientIpEntry)
 			}
 			continue
 		}
-		b, _ := json.Marshal(merged)
-		row := model.NodeClientIp{NodeGuid: guid, Email: email, Ips: string(b)}
+		encoded, _ := model.MarshalClientIpEntries(merged)
+		if current := existingByEmail[email]; current != nil && current.Ips == encoded {
+			continue
+		}
+		row := model.NodeClientIp{NodeGuid: guid, Email: email, Ips: encoded}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "node_guid"}, {Name: "email"}},
 			DoUpdates: clause.AssignmentColumns([]string{"ips"}),
@@ -112,9 +114,7 @@ func upsertNodeClientIps(guid string, perEmail map[string][]model.ClientIpEntry)
 	return tx.Commit().Error
 }
 
-// RecordLocalClientIps stores this panel's own Xray observations under its
-// panelGuid. Called by check_client_ip_job each scan with the live per-email IPs
-// the local core reported.
+// RecordLocalClientIps stores the scanner's local observations under this panel's GUID.
 func (s *InboundService) RecordLocalClientIps(panelGuid string, observed map[string][]model.ClientIpEntry) error {
 	return upsertNodeClientIps(panelGuid, observed)
 }
@@ -141,7 +141,18 @@ func (s *InboundService) MergeClientIpsByGuid(node *model.Node, trees map[string
 			}
 		}
 	}
+	if node != nil {
+		scoped, err := scopeNodeClientIps(database.GetDB(), node, trees)
+		if err != nil {
+			return err
+		}
+		trees = scoped
+	}
 	for guid, perEmail := range trees {
+		// Stored once per email: an oversized key would multiply into every row.
+		if len(guid) > maxPanelGuidLen {
+			continue
+		}
 		if err := upsertNodeClientIps(guid, perEmail); err != nil {
 			return err
 		}
@@ -172,6 +183,7 @@ func (s *InboundService) GetClientIpsByGuid() (map[string]map[string][]model.Cli
 		if len(fresh) == 0 {
 			continue
 		}
+		model.SortClientIpEntries(fresh)
 		if out[row.NodeGuid] == nil {
 			out[row.NodeGuid] = make(map[string][]model.ClientIpEntry)
 		}
@@ -325,10 +337,65 @@ func pruneStaleNodeClientIps(cutoff int64) error {
 		if len(kept) == len(entries) {
 			continue
 		}
-		b, _ := json.Marshal(kept)
-		if err := db.Model(&model.NodeClientIp{}).Where("id = ?", row.Id).Update("ips", string(b)).Error; err != nil {
+		encoded, _ := model.MarshalClientIpEntries(kept)
+		if err := db.Model(&model.NodeClientIp{}).Where("id = ?", row.Id).Update("ips", encoded).Error; err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// maxReportedIpsPerClient bounds one (node, client) list; the newest entries are kept.
+const maxReportedIpsPerClient = 256
+
+// scopeNodeClientIps keeps only what a node may report: its own key and its sub-nodes'
+// origins (never this panel's or another node's), its own clients, and no future dates.
+func scopeNodeClientIps(db *gorm.DB, node *model.Node, trees map[string]map[string][]model.ClientIpEntry) (map[string]map[string][]model.ClientIpEntry, error) {
+	allowed := map[string]struct{}{effectiveNodeKey(node): {}}
+	var origins []string
+	if err := db.Model(&model.Inbound{}).Where("node_id = ? AND origin_node_guid <> ''", node.Id).
+		Distinct().Pluck("origin_node_guid", &origins).Error; err != nil {
+		return nil, err
+	}
+	for _, origin := range origins {
+		allowed[origin] = struct{}{}
+	}
+	var others []*model.Node
+	if err := db.Where("id <> ?", node.Id).Find(&others).Error; err != nil {
+		return nil, err
+	}
+	for _, other := range others {
+		delete(allowed, effectiveNodeKey(other))
+		delete(allowed, other.Guid)
+	}
+	if panelGuid, err := (&SettingService{}).GetPanelGuid(); err == nil {
+		delete(allowed, panelGuid)
+	}
+	attached, err := nodeAttachedEmails(db, node.Id)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	scoped := make(map[string]map[string][]model.ClientIpEntry, len(trees))
+	for guid, perEmail := range trees {
+		if _, ok := allowed[guid]; !ok {
+			continue
+		}
+		kept := make(map[string][]model.ClientIpEntry, len(perEmail))
+		for email, entries := range perEmail {
+			if _, ok := attached[email]; !ok {
+				continue
+			}
+			clampClientIpEntries(entries, now)
+			if len(entries) > maxReportedIpsPerClient {
+				slices.SortFunc(entries, func(a, b model.ClientIpEntry) int { return cmp.Compare(b.Timestamp, a.Timestamp) })
+				entries = entries[:maxReportedIpsPerClient]
+			}
+			kept[email] = entries
+		}
+		if len(kept) > 0 {
+			scoped[guid] = kept
+		}
+	}
+	return scoped, nil
 }

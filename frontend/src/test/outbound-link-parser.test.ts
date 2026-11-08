@@ -9,6 +9,7 @@ import {
   parseHysteria2Link,
   parseWireguardLink,
 } from '@/lib/xray/outbound-link-parser';
+import { formValuesToWirePayload, rawOutboundToFormValues } from '@/lib/xray/outbound-form-adapter';
 import { Base64 } from '@/utils';
 
 // Focused acceptance tests for the share-link parsers — one happy-path
@@ -55,6 +56,36 @@ describe('parseVmessLink', () => {
     expect((stream.wsSettings as Record<string, unknown>).path).toBe('/ws');
     expect((stream.tlsSettings as Record<string, unknown>).serverName).toBe('example.com');
     expect((stream.tlsSettings as Record<string, unknown>).alpn).toEqual(['h2', 'http/1.1']);
+  });
+
+  // The exporter writes ech/vcn/pcs into the vmess object, so the importer has
+  // to read them instead of leaving the tls checks it seeded empty.
+  it('keeps the ech, vcn and pcs certificate checks', () => {
+    const json = {
+      v: '2',
+      ps: 'pinned-vmess',
+      add: '1.2.3.4',
+      port: 8443,
+      id: '11111111-2222-4333-8444-555555555555',
+      scy: 'auto',
+      net: 'tcp',
+      tls: 'tls',
+      sni: 'vmess.example.com',
+      fp: 'chrome',
+      ech: 'AEX+DQBB',
+      vcn: 'vcn.example.com',
+      pcs: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      cs: 'TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256',
+    };
+    const link = `vmess://${Base64.encode(JSON.stringify(json))}`;
+    const out = parseVmessLink(link);
+    expect(out).not.toBeNull();
+    const stream = out?.streamSettings as Record<string, unknown>;
+    const tls = stream.tlsSettings as Record<string, unknown>;
+    expect(tls.echConfigList).toBe('AEX+DQBB');
+    expect(tls.cipherSuites).toBe('TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256');
+    expect(tls.verifyPeerCertByName).toBe('vcn.example.com');
+    expect(tls.pinnedPeerCertSha256).toBe('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');
   });
 
   it('returns null for non-vmess links', () => {
@@ -196,10 +227,36 @@ describe('parseVlessLink — XHTTP advanced fields', () => {
 });
 
 describe('parseVlessLink', () => {
+  // Older panels share xdns as string lists (pre-26.9.30, a load error) or as name/typed
+  // resolver objects (26.9.30) that xray-core 26.10.10 reads as no domain at all.
+  it.each([
+    ['pre-26.9.30 string lists', { resolvers: ['t.example.com+udp://8.8.8.8:53'] }],
+    [
+      '26.9.30 objects',
+      {
+        domains: [{ name: 't.example.com', types: [16], edns0: 1232 }],
+        resolvers: [{ type: 'udp', settings: { addr: '8.8.8.8:53' } }],
+      },
+    ],
+  ])('upgrades a %s xdns fm= mask to names/addrs', (_shape, settings) => {
+    const fm = encodeURIComponent(JSON.stringify({ udp: [{ type: 'xdns', settings }] }));
+    const out = parseVlessLink(
+      `vless://11111111-2222-4333-8444-555555555555@srv:53?type=kcp&security=none&fm=${fm}#dns`,
+    );
+    const finalmask = (out!.streamSettings as Record<string, unknown>).finalmask as {
+      udp: Array<{ settings: unknown }>;
+    };
+    expect(finalmask.udp[0].settings).toEqual({
+      domains: [{ names: ['t.example.com'], types: [16], edns0: 1232 }],
+      resolvers: [{ addrs: ['udp://8.8.8.8:53'] }],
+    });
+  });
+
   it('parses a vless:// link with reality', () => {
     const link =
       'vless://11111111-2222-4333-8444-555555555555@srv.example:443' +
       '?type=tcp&security=reality&pbk=pubkey&sid=abcd&fp=chrome&sni=cloudflare.com&flow=xtls-rprx-vision' +
+      '&support-x25519mlkem768=true' +
       '#imported-vless';
     const out = parseVlessLink(link);
     expect(out?.protocol).toBe('vless');
@@ -215,6 +272,14 @@ describe('parseVlessLink', () => {
     expect(reality.publicKey).toBe('pubkey');
     expect(reality.shortId).toBe('abcd');
     expect(reality.serverName).toBe('cloudflare.com');
+    // The hint is for Mihomo; xray-core's REALITYConfig has no such field.
+    expect(reality).not.toHaveProperty('supportX25519Mlkem768');
+
+    const form = rawOutboundToFormValues(out!);
+    const saved = formValuesToWirePayload(form);
+    const savedReality = (saved.streamSettings as Record<string, unknown>)
+      .realitySettings as Record<string, unknown>;
+    expect(savedReality).not.toHaveProperty('supportX25519Mlkem768');
   });
 
   it('parses encryption + pqv (post-quantum) into settings and mldsa65Verify', () => {
@@ -238,6 +303,117 @@ describe('parseVlessLink', () => {
   });
 });
 
+describe('mKCP share params', () => {
+  // The emitter flattens one mkcp-legacy mask per field into headerType/seed; a merged
+  // mask drops the seed in xray-core (MkcpLegacy.Build), so import rebuilds them separately.
+  type Mask = { type: string; settings: { header: string; value: string } };
+  const vmessKcp = (fields: Record<string, unknown>) =>
+    'vmess://' +
+    Base64.encode(
+      JSON.stringify({
+        v: '2',
+        add: 'h.com',
+        port: 443,
+        id: '11111111-2222-4333-8444-555555555555',
+        net: 'kcp',
+        tls: 'none',
+        ...fields,
+      }),
+    );
+  const parse = (link: string) => {
+    const out = link.startsWith('trojan://')
+      ? parseTrojanLink(link)
+      : link.startsWith('vmess://')
+        ? parseVmessLink(link)
+        : parseVlessLink(link);
+    expect(out).not.toBeNull();
+    const stream = out!.streamSettings as Record<string, unknown>;
+    const kcp = stream.kcpSettings as { mtu: number; tti: number };
+    const udp = (stream.finalmask as { udp?: Mask[] } | undefined)?.udp ?? [];
+    return {
+      kcp: { mtu: kcp.mtu, tti: kcp.tti },
+      masks: udp.map((m) => [m.type, m.settings.header, m.settings.value]),
+    };
+  };
+
+  it.each([
+    [
+      'vless header and seed become two masks, seed first',
+      'vless://11111111-2222-4333-8444-555555555555@h.com:443?type=kcp&headerType=wechat-video&seed=secret-seed&mtu=1400&tti=50&security=none#kcp1',
+      { mtu: 1400, tti: 50 },
+      [
+        ['mkcp-legacy', '', 'secret-seed'],
+        ['mkcp-legacy', 'wechat', ''],
+      ],
+    ],
+    [
+      'trojan header only adds no seed mask',
+      'trojan://pw@h.com:443?type=kcp&headerType=srtp&security=none#kcp-tj',
+      { mtu: 1350, tti: 20 },
+      [['mkcp-legacy', 'srtp', '']],
+    ],
+    [
+      'seed only adds no header mask',
+      'vless://uuid@h.com:443?type=kcp&headerType=none&seed=abc123&security=none',
+      { mtu: 1350, tti: 20 },
+      [['mkcp-legacy', '', 'abc123']],
+    ],
+    [
+      'mtu/tti outside KCPConfig.Build bounds keep the defaults',
+      'vless://uuid@h.com:443?type=kcp&mtu=10&tti=5000&security=none',
+      { mtu: 1350, tti: 20 },
+      [],
+    ],
+    [
+      'non-decimal mtu keeps the default like the Go importer',
+      'vless://uuid@h.com:443?type=kcp&mtu=1.5&tti=1e2&security=none',
+      { mtu: 1350, tti: 20 },
+      [],
+    ],
+    [
+      'a prototype key is not a header type',
+      'vless://uuid@h.com:443?type=kcp&headerType=constructor&seed=abc&security=none',
+      { mtu: 1350, tti: 20 },
+      [],
+    ],
+    [
+      'vmess header and seed from type and path',
+      vmessKcp({ type: 'wechat-video', path: 'secret-seed', mtu: 1400, tti: 50 }),
+      { mtu: 1400, tti: 50 },
+      [
+        ['mkcp-legacy', '', 'secret-seed'],
+        ['mkcp-legacy', 'wechat', ''],
+      ],
+    ],
+    [
+      'vmess fm mkcp-legacy mask wins over path',
+      vmessKcp({
+        type: 'none',
+        path: 's3cr3tSeed',
+        mtu: 1350,
+        tti: 20,
+        fm: JSON.stringify({
+          udp: [{ settings: { header: '', value: 's3cr3tSeed' }, type: 'mkcp-legacy' }],
+        }),
+      }),
+      { mtu: 1350, tti: 20 },
+      [['mkcp-legacy', '', 's3cr3tSeed']],
+    ],
+  ])('%s', (_name, link, kcp, masks) => {
+    expect(parse(link)).toEqual({ kcp, masks });
+  });
+
+  it('keeps a vmess fm udp mask', () => {
+    const fm = JSON.stringify({
+      udp: [{ type: 'salamander', settings: { password: 'obfspw123' } }],
+    });
+    const out = parseVmessLink(vmessKcp({ type: 'none', fm }));
+    expect((out!.streamSettings as Record<string, unknown>).finalmask).toEqual({
+      udp: [{ type: 'salamander', settings: { password: 'obfspw123' } }],
+    });
+  });
+});
+
 describe('parseTrojanLink', () => {
   it('parses a trojan:// link with ws + tls', () => {
     const link =
@@ -253,6 +429,15 @@ describe('parseTrojanLink', () => {
     const stream = out?.streamSettings as Record<string, unknown>;
     expect(stream.network).toBe('ws');
     expect((stream.wsSettings as Record<string, unknown>).path).toBe('/tj');
+  });
+
+  it('reads the cs cipher suites into tlsSettings, as the Go link parser does', () => {
+    const out = parseTrojanLink(
+      'trojan://pw@srv.example:443?type=tcp&security=tls&sni=srv.example&fp=unsafe&cs=TLS_AES_256_GCM_SHA384#cs',
+    );
+    const stream = out!.streamSettings as Record<string, unknown>;
+    const tls = stream.tlsSettings as Record<string, unknown>;
+    expect(tls.cipherSuites).toBe('TLS_AES_256_GCM_SHA384');
   });
 });
 
@@ -304,6 +489,53 @@ describe('parseShadowsocksLink', () => {
     expect(settings.servers[0].password).toBe('legacypw');
   });
 
+  it('preserves Xray TLS query params on import (round-trip)', () => {
+    const userinfo = Base64.encode('chacha20-ietf-poly1305:secretpass', true);
+    const link =
+      `ss://${userinfo}@example.com:443` +
+      '?alpn=h2%2Chttp%2F1.1&fp=firefox&security=tls&sni=example.com&type=tcp#user';
+    const out = parseShadowsocksLink(link);
+    expect(out?.protocol).toBe('shadowsocks');
+    expect(out?.tag).toBe('user');
+    const settings = out?.settings as {
+      servers: Array<{ address: string; port: number; method: string; password: string }>;
+    };
+    expect(settings.servers[0]).toMatchObject({
+      address: 'example.com',
+      port: 443,
+      method: 'chacha20-ietf-poly1305',
+      password: 'secretpass',
+    });
+    const stream = out?.streamSettings as Record<string, unknown>;
+    expect(stream.network).toBe('tcp');
+    expect(stream.security).toBe('tls');
+    const tls = stream.tlsSettings as Record<string, unknown>;
+    expect(tls.serverName).toBe('example.com');
+    expect(tls.fingerprint).toBe('firefox');
+    expect(tls.alpn).toEqual(['h2', 'http/1.1']);
+  });
+
+  // The panel exports tcp/http obfuscation as the SIP002 plugin only, so the
+  // importer has to rebuild the header it stands for.
+  it('rebuilds the tcp/http header from the obfs-local plugin', () => {
+    const userinfo = Base64.encode('aes-256-gcm:secretpass', true);
+    const plugin = encodeURIComponent('obfs-local;obfs=http;obfs-host=obfs.example.com');
+    const link = `ss://${userinfo}@example.com:8388?plugin=${plugin}#user`;
+    const stream = parseShadowsocksLink(link)?.streamSettings as Record<string, unknown>;
+    expect((stream.tcpSettings as Record<string, unknown>).header).toMatchObject({
+      type: 'http',
+      request: { headers: { Host: ['obfs.example.com'] } },
+    });
+  });
+
+  it('leaves a plugin without an xray header alone', () => {
+    const userinfo = Base64.encode('aes-256-gcm:secretpass', true);
+    const plugin = encodeURIComponent('obfs-local;obfs=tls');
+    const link = `ss://${userinfo}@example.com:8388?plugin=${plugin}#user`;
+    const stream = parseShadowsocksLink(link)?.streamSettings as Record<string, unknown>;
+    expect((stream.tcpSettings as Record<string, unknown>).header).toMatchObject({ type: 'none' });
+  });
+
   it('decodes URL-safe base64 userinfo (as the emitter writes it)', () => {
     const method = 'aes-256-gcm';
     const password = '>>>';
@@ -317,6 +549,42 @@ describe('parseShadowsocksLink', () => {
 });
 
 describe('parseHysteria2Link', () => {
+  // A panel older than the 26.9.9 core shares its hop range as quicParams.udpHop in fm=,
+  // which the core ignores; the import must hand it the udphop mask instead.
+  it('upgrades a legacy fm= quicParams.udpHop to the udphop mask', () => {
+    const fm = encodeURIComponent(
+      JSON.stringify({ quicParams: { udpHop: { ports: '20000-30000', interval: '5-10' } } }),
+    );
+    const out = parseHysteria2Link(
+      `hysteria2://auth@hy.example.com:443?sni=hy.example.com&fm=${fm}#hy`,
+    );
+    expect((out!.streamSettings as Record<string, unknown>).finalmask).toEqual({
+      udp: [
+        {
+          type: 'udphop',
+          settings: { mode: 'intervalRemote', remotePorts: '20000-30000', interval: '5-10' },
+        },
+      ],
+    });
+  });
+
+  // The core reverses the UDP masks and refuses a udphop anywhere but last ("incorrect index"),
+  // so an import of a link that lists it first must reorder it like the Go importer does.
+  it('moves a udphop mask listed first in fm= to the end', () => {
+    const hop = {
+      type: 'udphop',
+      settings: { mode: 'intervalRemote', remotePorts: '20000-30000' },
+    };
+    const salamander = { type: 'salamander', settings: { password: 's3cr3t' } };
+    const fm = encodeURIComponent(JSON.stringify({ udp: [hop, salamander] }));
+    const out = parseHysteria2Link(
+      `hysteria2://auth@hy.example.com:443?sni=hy.example.com&fm=${fm}#hy`,
+    );
+    expect((out!.streamSettings as Record<string, unknown>).finalmask).toEqual({
+      udp: [salamander, hop],
+    });
+  });
+
   it('parses a hysteria2:// link with sni', () => {
     const link = 'hysteria2://auth-secret@srv.example:443?sni=example.com#imported-hy2';
     const out = parseHysteria2Link(link);
@@ -443,7 +711,9 @@ describe('parseHysteria2Link', () => {
     expect((udp[0].settings as Record<string, unknown>).password).toBe('fromobfs');
   });
 
-  it('reconstructs udpHop from the standard mport param', () => {
+  // xray-core 26.9.9 ignores quicParams.udpHop; hopping is a 'udphop' UDP mask
+  // and its mode must be one the core's UDPHop.Build() accepts.
+  it('reconstructs a udphop mask from the standard mport param', () => {
     const out = parseHysteria2Link(
       'hysteria2://auth@srv:443?security=tls&mport=20000-50000#hy2-mport',
     );
@@ -451,16 +721,25 @@ describe('parseHysteria2Link', () => {
       string,
       unknown
     >;
-    const quic = finalmask.quicParams as Record<string, unknown>;
-    const udpHop = quic.udpHop as Record<string, unknown>;
-    expect(udpHop.ports).toBe('20000-50000');
-    expect(udpHop.interval).toBe('5-10');
+    const udp = finalmask.udp as Array<Record<string, unknown>>;
+    const hop = udp.find((mask) => mask.type === 'udphop');
+    expect(hop).toBeDefined();
+    const settings = hop!.settings as Record<string, unknown>;
+    expect(settings.remotePorts).toBe('20000-50000');
+    expect(settings.interval).toBe('5-10');
+    expect(settings.mode).toBe('intervalremote');
+    expect((finalmask.quicParams as Record<string, unknown> | undefined)?.udpHop).toBeUndefined();
   });
 
-  it('lets an fm= udpHop win over mport', () => {
+  it('lets an fm= udphop mask win over mport', () => {
     const fm = encodeURIComponent(
       JSON.stringify({
-        quicParams: { udpHop: { ports: '30000-40000', interval: '7-9' } },
+        udp: [
+          {
+            type: 'udphop',
+            settings: { mode: 'intervalremote', interval: '7-9', remotePorts: '30000-40000' },
+          },
+        ],
       }),
     );
     const link = `hysteria2://auth@srv:443?security=tls&mport=1-2&fm=${fm}#hy2-mport-fm`;
@@ -469,12 +748,11 @@ describe('parseHysteria2Link', () => {
       string,
       unknown
     >;
-    const udpHop = (finalmask.quicParams as Record<string, unknown>).udpHop as Record<
-      string,
-      unknown
-    >;
-    expect(udpHop.ports).toBe('30000-40000');
-    expect(udpHop.interval).toBe('7-9');
+    const udp = finalmask.udp as Array<Record<string, unknown>>;
+    expect(udp).toHaveLength(1);
+    const settings = udp[0].settings as Record<string, unknown>;
+    expect(settings.remotePorts).toBe('30000-40000');
+    expect(settings.interval).toBe('7-9');
   });
 
   it('round-trips the salamander packetSize (Gecko) under fm', () => {
@@ -641,8 +919,14 @@ describe('parseVlessLink — extra / fm / x_padding_bytes (B20)', () => {
     const quicParams = finalmask.quicParams as Record<string, unknown>;
     expect(quicParams.congestion).toBe('bbr');
     expect(quicParams.maxIdleTimeout).toBe(30);
-    expect((quicParams.udpHop as Record<string, unknown>).interval).toBe('5-10');
-    expect((quicParams.udpHop as Record<string, unknown>).ports).toBe('20000-50000');
+    // xray-core 26.9.9 ignores quicParams.udpHop; the import moves it to the udphop mask.
+    expect(quicParams.udpHop).toBeUndefined();
+    expect(finalmask.udp).toEqual([
+      {
+        type: 'udphop',
+        settings: { mode: 'intervalRemote', remotePorts: '20000-50000', interval: '5-10' },
+      },
+    ]);
   });
 
   it('falls back to x_padding_bytes when extra has no xPaddingBytes', () => {
@@ -838,5 +1122,34 @@ describe('obfs=gecko packetSize validation', () => {
     ['over cap', `${base}&minPacketSize=512&maxPacketSize=4096`],
   ])('drops the %s range', (_name, link) => {
     expect(packetSizeOf(link)).toBeUndefined();
+  });
+});
+
+describe('parseOutboundLink — host-local keys', () => {
+  it('drops keys that redirect the dial or name host files, however they are cased', () => {
+    const extra = encodeURIComponent(
+      JSON.stringify({
+        downloadSettings: {
+          address: '8.8.8.8',
+          port: 443,
+          sockopt: { dialerProxy: 'api', tcpFastOpen: true },
+          tlsSettings: {
+            serverName: 'cdn.example.com',
+            certificates: [{ CERTIFICATEFILE: '/dev/zero', keyFile: '/etc/shadow' }],
+            maſterKeyLog: '/root/keys',
+          },
+        },
+      }),
+    );
+    const fm = encodeURIComponent(
+      JSON.stringify({ tcp: [{ type: 'header-custom', settings: { DialerProxy: 'api' } }] }),
+    );
+    const out = parseOutboundLink(
+      `vless://uuid@8.8.8.8:443?type=xhttp&security=tls&extra=${extra}&fm=${fm}#node`,
+    );
+    const json = JSON.stringify(out);
+    expect(json).not.toMatch(/dialerproxy|certificatefile|keyfile|maſterkeylog/i);
+    expect(json).toContain('"tcpFastOpen":true');
+    expect(json).toContain('"serverName":"cdn.example.com"');
   });
 });

@@ -1,4 +1,6 @@
 import { lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { useLocation, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
   Badge,
@@ -22,6 +24,7 @@ import {
   Table,
   Tag,
   Tooltip,
+  Typography,
   message,
 } from 'antd';
 import type { ColumnsType, TableProps } from 'antd/es/table';
@@ -57,6 +60,7 @@ import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useClients } from '@/hooks/useClients';
 import { useNodesQuery } from '@/api/queries/useNodesQuery';
+import { useHostsQuery } from '@/api/queries/useHostsQuery';
 import { useDatepicker } from '@/hooks/useDatepicker';
 import type {
   ClientRecord,
@@ -109,7 +113,7 @@ function UngroupIcon() {
         height: '1em',
       }}
     >
-      <TagsOutlined />
+      <TagsOutlined aria-hidden />
       <span
         aria-hidden="true"
         style={{
@@ -151,6 +155,40 @@ function ClientEmailList({ emails, total }: { emails: string[]; total: number })
   );
 }
 
+interface SummaryStatProps {
+  title: string;
+  value: number;
+  prefix: ReactNode;
+  emails?: string[];
+  selected?: boolean;
+  onSelect: () => void;
+}
+
+function SummaryStat({ title, value, prefix, emails, selected, onSelect }: SummaryStatProps) {
+  const stat = (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      className={selected ? 'summary-stat selected' : 'summary-stat'}
+      onClick={onSelect}
+      onKeyDown={activateOnKey(onSelect)}
+    >
+      <Statistic title={title} value={String(value)} prefix={prefix} />
+    </div>
+  );
+  if (!emails) return stat;
+  return (
+    <Popover
+      title={title}
+      open={value ? undefined : false}
+      content={<ClientEmailList emails={emails} total={value} />}
+    >
+      {stat}
+    </Popover>
+  );
+}
+
 type Bucket = 'active' | 'deactive' | 'depleted' | 'expiring';
 
 interface PersistedFilterState {
@@ -175,6 +213,7 @@ const INBOUND_PROTOCOL_COLORS: Record<string, string> = {
   http: 'purple',
   mixed: 'lime',
   tunnel: 'orange',
+  tuic: 'orange',
 };
 const INBOUND_CHIP_LIMIT = 1;
 // A shared empty array keeps the memoised chip cell from seeing a fresh prop for
@@ -343,6 +382,15 @@ export default function ClientsPage() {
   // Node list for the Nodes filter; the section only renders when the panel
   // actually manages nodes (#4997).
   const { nodes } = useNodesQuery();
+  // Tunnel configs advertise these Hosts, so an empty list must mean "no hosts"
+  // and not "not loaded yet" — the page gate waits for it.
+  const {
+    hosts,
+    fetched: hostsFetched,
+    fetchError: hostsFetchError,
+    refetch: refetchHosts,
+  } = useHostsQuery();
+  const hostsError = hosts.length > 0 ? '' : hostsFetchError;
 
   const [togglingEmail, setTogglingEmail] = useState<string | null>(null);
   const [formOpen, setFormOpen] = useState(false);
@@ -382,7 +430,12 @@ export default function ClientsPage() {
   >(null);
 
   const initial = readFilterState();
-  const [searchKey, setSearchKey] = useState(initial.searchKey);
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const searchParam = searchParams.get('search');
+  const [searchKey, setSearchKey] = useState(
+    searchParam !== null ? searchParam : initial.searchKey,
+  );
   const [filters, setFilters] = useState<ClientFilters>(initial.filters);
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
 
@@ -405,6 +458,15 @@ export default function ClientsPage() {
   // debouncedSearch lags behind the input so we don't spam the server on every
   // keystroke; the search box still feels instant locally.
   const [debouncedSearch, setDebouncedSearch] = useState(searchKey);
+  const [prevLocationKey, setPrevLocationKey] = useState(location.key);
+
+  if (location.key !== prevLocationKey) {
+    setPrevLocationKey(location.key);
+    if (searchParam !== null) {
+      setSearchKey(searchParam);
+      setDebouncedSearch(searchParam);
+    }
+  }
 
   useEffect(() => {
     localStorage.setItem(
@@ -717,11 +779,11 @@ export default function ClientsPage() {
   const onRefreshClick = useCallback(async () => {
     setRefreshing(true);
     try {
-      await refresh();
+      await Promise.all([refresh(), refetchHosts()]);
     } finally {
       setRefreshing(false);
     }
-  }, [refresh]);
+  }, [refresh, refetchHosts]);
 
   const openText = useCallback((opts: { title: string; content: string; fileName?: string }) => {
     setTextTitle(opts.title);
@@ -1019,6 +1081,7 @@ export default function ClientsPage() {
             checked={!!record.enable}
             size="small"
             loading={togglingEmail === record.email}
+            aria-label={t('pages.clients.enabled')}
             onChange={(next) => onToggleEnable(record, next)}
           />
         ),
@@ -1076,18 +1139,22 @@ export default function ClientsPage() {
         width: 130,
         hidden: allGroups.length === 0,
         render: (_v, record) => {
-          if (!record.group) return <span style={{ color: 'rgba(0,0,0,0.45)' }}>—</span>;
+          if (!record.group) return <Typography.Text type="secondary">—</Typography.Text>;
           const isActive = filters.groups.includes(record.group);
+          const filterByGroup = () => {
+            if (!isActive) setFilters({ ...filters, groups: [...filters.groups, record.group!] });
+          };
           return (
             <Tag
               color="geekblue"
               style={{ margin: 0, cursor: 'pointer', opacity: isActive ? 0.6 : 1 }}
+              role="button"
+              tabIndex={0}
               onClick={(e) => {
                 e.stopPropagation();
-                if (!isActive) {
-                  setFilters({ ...filters, groups: [...filters.groups, record.group!] });
-                }
+                filterByGroup();
               }}
+              onKeyDown={activateOnKey(filterByGroup)}
             >
               {record.group}
             </Tag>
@@ -1207,6 +1274,15 @@ export default function ClientsPage() {
   const someSelected =
     selectedRowKeys.length > 0 && selectedRowKeys.length < filteredClients.length;
 
+  const isOnlyBucket = (bucket: string) =>
+    filters.buckets.length === 1 && filters.buckets[0] === bucket;
+
+  // Clicking the card that is already the sole status filter clears it again.
+  function selectBucket(bucket: string | null) {
+    const buckets = bucket && !isOnlyBucket(bucket) ? [bucket] : [];
+    setFilters({ ...filters, buckets });
+  }
+
   function clearOneFilter<K extends keyof ClientFilters>(key: K) {
     if (key === 'expiryFrom' || key === 'expiryTo') {
       setFilters({ ...filters, expiryFrom: undefined, expiryTo: undefined });
@@ -1228,14 +1304,20 @@ export default function ClientsPage() {
 
         <Layout className="content-shell">
           <Layout.Content id="content-layout" className="content-area">
-            <Spin spinning={!fetched} delay={200} description={t('loading')} size="large">
-              {!fetched ? (
+            <Spin
+              aria-live="off"
+              spinning={!fetched || !hostsFetched}
+              delay={200}
+              description={t('loading')}
+              size="large"
+            >
+              {!fetched || !hostsFetched ? (
                 <div className="loading-spacer" />
-              ) : fetchError ? (
+              ) : fetchError || hostsError ? (
                 <Result
                   status="error"
                   title={t('somethingWentWrong')}
-                  subTitle={fetchError}
+                  subTitle={fetchError || hostsError}
                   extra={
                     <Button type="primary" loading={refreshing} onClick={onRefreshClick}>
                       {t('refresh')}
@@ -1248,89 +1330,60 @@ export default function ClientsPage() {
                     <Card size="small" hoverable className="summary-card">
                       <Row gutter={[16, 12]}>
                         <Col xs={12} sm={8} md={4}>
-                          <Statistic
+                          <SummaryStat
                             title={t('clients')}
-                            value={String(summary.total)}
-                            prefix={<TeamOutlined />}
+                            value={summary.total}
+                            prefix={<TeamOutlined aria-hidden />}
+                            onSelect={() => selectBucket(null)}
                           />
                         </Col>
                         <Col xs={12} sm={8} md={4}>
-                          <Popover
+                          <SummaryStat
                             title={t('online')}
-                            open={summary.onlineCount ? undefined : false}
-                            content={
-                              <ClientEmailList
-                                emails={summary.online}
-                                total={summary.onlineCount}
-                              />
-                            }
-                          >
-                            <Statistic
-                              title={t('online')}
-                              value={String(summary.onlineCount)}
-                              prefix={<span className="dot dot-blue" />}
-                            />
-                          </Popover>
+                            value={summary.onlineCount}
+                            emails={summary.online}
+                            prefix={<span className="dot dot-blue" />}
+                            selected={isOnlyBucket('online')}
+                            onSelect={() => selectBucket('online')}
+                          />
                         </Col>
                         <Col xs={12} sm={8} md={4}>
-                          <Popover
+                          <SummaryStat
                             title={t('depleted')}
-                            open={summary.depletedCount ? undefined : false}
-                            content={
-                              <ClientEmailList
-                                emails={summary.depleted}
-                                total={summary.depletedCount}
-                              />
-                            }
-                          >
-                            <Statistic
-                              title={t('depleted')}
-                              value={String(summary.depletedCount)}
-                              prefix={<span className="dot dot-red" />}
-                            />
-                          </Popover>
+                            value={summary.depletedCount}
+                            emails={summary.depleted}
+                            prefix={<span className="dot dot-red" />}
+                            selected={isOnlyBucket('depleted')}
+                            onSelect={() => selectBucket('depleted')}
+                          />
                         </Col>
                         <Col xs={12} sm={8} md={4}>
-                          <Popover
+                          <SummaryStat
                             title={t('depletingSoon')}
-                            open={summary.expiringCount ? undefined : false}
-                            content={
-                              <ClientEmailList
-                                emails={summary.expiring}
-                                total={summary.expiringCount}
-                              />
-                            }
-                          >
-                            <Statistic
-                              title={t('depletingSoon')}
-                              value={String(summary.expiringCount)}
-                              prefix={<span className="dot dot-orange" />}
-                            />
-                          </Popover>
+                            value={summary.expiringCount}
+                            emails={summary.expiring}
+                            prefix={<span className="dot dot-orange" />}
+                            selected={isOnlyBucket('expiring')}
+                            onSelect={() => selectBucket('expiring')}
+                          />
                         </Col>
                         <Col xs={12} sm={8} md={4}>
-                          <Popover
+                          <SummaryStat
                             title={t('disabled')}
-                            open={summary.deactiveCount ? undefined : false}
-                            content={
-                              <ClientEmailList
-                                emails={summary.deactive}
-                                total={summary.deactiveCount}
-                              />
-                            }
-                          >
-                            <Statistic
-                              title={t('disabled')}
-                              value={String(summary.deactiveCount)}
-                              prefix={<span className="dot dot-gray" />}
-                            />
-                          </Popover>
+                            value={summary.deactiveCount}
+                            emails={summary.deactive}
+                            prefix={<span className="dot dot-gray" />}
+                            selected={isOnlyBucket('deactive')}
+                            onSelect={() => selectBucket('deactive')}
+                          />
                         </Col>
                         <Col xs={12} sm={8} md={4}>
-                          <Statistic
+                          <SummaryStat
                             title={t('subscription.active')}
-                            value={String(summary.active)}
+                            value={summary.active}
                             prefix={<span className="dot dot-green" />}
+                            selected={isOnlyBucket('active')}
+                            onSelect={() => selectBucket('active')}
                           />
                         </Col>
                       </Row>
@@ -1346,7 +1399,7 @@ export default function ClientsPage() {
                           {selectedRowKeys.length === 0 ? (
                             <Button
                               type="primary"
-                              icon={<PlusOutlined />}
+                              icon={<PlusOutlined aria-hidden />}
                               onClick={onAdd}
                               aria-label={t('pages.clients.addClients')}
                             >
@@ -1371,20 +1424,20 @@ export default function ClientsPage() {
                                   ? [
                                       {
                                         key: 'attach',
-                                        icon: <UsergroupAddOutlined />,
+                                        icon: <UsergroupAddOutlined aria-hidden />,
                                         label: t('pages.clients.attach'),
                                         onClick: () => setBulkAttachOpen(true),
                                       },
                                       {
                                         key: 'detach',
-                                        icon: <UsergroupDeleteOutlined />,
+                                        icon: <UsergroupDeleteOutlined aria-hidden />,
                                         label: t('pages.clients.detach'),
                                         danger: true,
                                         onClick: () => setBulkDetachOpen(true),
                                       },
                                       {
                                         key: 'addToGroup',
-                                        icon: <TagsOutlined />,
+                                        icon: <TagsOutlined aria-hidden />,
                                         label: t('pages.clients.addToGroup'),
                                         onClick: () => setBulkGroupOpen(true),
                                       },
@@ -1398,26 +1451,26 @@ export default function ClientsPage() {
                                       { type: 'divider' as const },
                                       {
                                         key: 'enable',
-                                        icon: <CheckCircleOutlined />,
+                                        icon: <CheckCircleOutlined aria-hidden />,
                                         label: t('pages.clients.enable'),
                                         onClick: () => onBulkSetEnable(true),
                                       },
                                       {
                                         key: 'disable',
-                                        icon: <StopOutlined />,
+                                        icon: <StopOutlined aria-hidden />,
                                         label: t('pages.clients.disable'),
                                         danger: true,
                                         onClick: () => onBulkSetEnable(false),
                                       },
                                       {
                                         key: 'adjust',
-                                        icon: <ClockCircleOutlined />,
+                                        icon: <ClockCircleOutlined aria-hidden />,
                                         label: t('pages.clients.adjust'),
                                         onClick: () => setBulkAdjustOpen(true),
                                       },
                                       {
                                         key: 'subLinks',
-                                        icon: <LinkOutlined />,
+                                        icon: <LinkOutlined aria-hidden />,
                                         label: t('pages.clients.subLinks'),
                                         onClick: () => setSubLinksOpen(true),
                                       },
@@ -1425,39 +1478,39 @@ export default function ClientsPage() {
                                   : [
                                       {
                                         key: 'bulk',
-                                        icon: <UsergroupAddOutlined />,
+                                        icon: <UsergroupAddOutlined aria-hidden />,
                                         label: t('pages.clients.bulk'),
                                         onClick: () => setBulkAddOpen(true),
                                       },
                                       {
                                         key: 'export',
-                                        icon: <DownloadOutlined />,
+                                        icon: <DownloadOutlined aria-hidden />,
                                         label: t('pages.clients.exportClients'),
                                         onClick: onExportClients,
                                       },
                                       {
                                         key: 'import',
-                                        icon: <UploadOutlined />,
+                                        icon: <UploadOutlined aria-hidden />,
                                         label: t('pages.clients.importClients'),
                                         onClick: onImportClients,
                                       },
                                       {
                                         key: 'resetAll',
-                                        icon: <RetweetOutlined />,
+                                        icon: <RetweetOutlined aria-hidden />,
                                         label: t('pages.clients.resetAllTraffics'),
                                         onClick: onResetAllTraffics,
                                       },
                                       { type: 'divider' as const },
                                       {
                                         key: 'delDepleted',
-                                        icon: <RestOutlined />,
+                                        icon: <RestOutlined aria-hidden />,
                                         label: t('pages.clients.delDepleted'),
                                         danger: true,
                                         onClick: onDelDepleted,
                                       },
                                       {
                                         key: 'delOrphans',
-                                        icon: <DisconnectOutlined />,
+                                        icon: <DisconnectOutlined aria-hidden />,
                                         label: t('pages.clients.delOrphans'),
                                         danger: true,
                                         onClick: onDeleteOrphans,
@@ -1465,14 +1518,14 @@ export default function ClientsPage() {
                                     ],
                             }}
                           >
-                            <Button icon={<MoreOutlined />} aria-label={t('more')}>
+                            <Button icon={<MoreOutlined aria-hidden />} aria-label={t('more')}>
                               {!isMobile && t('more')}
                             </Button>
                           </Dropdown>
                           {selectedRowKeys.length > 0 && (
                             <Button
                               danger
-                              icon={<DeleteOutlined />}
+                              icon={<DeleteOutlined aria-hidden />}
                               onClick={onBulkDelete}
                               style={{ marginInlineStart: 'auto' }}
                               aria-label={t('delete')}
@@ -1489,14 +1542,14 @@ export default function ClientsPage() {
                           onChange={(e) => setSearchKey(e.target.value)}
                           placeholder={t('pages.clients.searchPlaceholder')}
                           allowClear
-                          prefix={<SearchOutlined />}
+                          prefix={<SearchOutlined aria-hidden />}
                           size={isMobile ? 'small' : 'middle'}
                           style={{ maxWidth: 320 }}
                           aria-label={t('search')}
                         />
                         <Badge count={activeCount} size="small" offset={[-4, 4]}>
                           <Button
-                            icon={<FilterOutlined />}
+                            icon={<FilterOutlined aria-hidden />}
                             size={isMobile ? 'small' : 'middle'}
                             onClick={() => setFilterDrawerOpen(true)}
                             type={activeCount > 0 ? 'primary' : 'default'}
@@ -1509,7 +1562,7 @@ export default function ClientsPage() {
                           value={sortValueFor(sortColumn, sortOrder)}
                           aria-label={t('sort')}
                           size={isMobile ? 'small' : 'middle'}
-                          suffix={<SortAscendingOutlined />}
+                          suffix={<SortAscendingOutlined aria-hidden />}
                           style={{ minWidth: isMobile ? 130 : 200 }}
                           onChange={(value) => {
                             const opt = SORT_OPTIONS.find((o) => o.value === value);
@@ -1662,14 +1715,17 @@ export default function ClientsPage() {
                           locale={{
                             emptyText: (
                               <div className="clients-empty">
-                                <TeamOutlined style={{ fontSize: 32, marginBottom: 8 }} />
+                                <TeamOutlined
+                                  aria-hidden
+                                  style={{ fontSize: 32, marginBottom: 8 }}
+                                />
                                 <div>{t('noData')}</div>
                               </div>
                             ),
                           }}
                         />
                       ) : (
-                        <Spin spinning={transitioning}>
+                        <Spin aria-live="off" spinning={transitioning}>
                           <div className="client-cards">
                             {filteredClients.length > 0 && (
                               <div className="card-bulk-bar">
@@ -1687,7 +1743,7 @@ export default function ClientsPage() {
                             )}
                             {filteredClients.length === 0 && (
                               <div className="card-empty">
-                                <TeamOutlined style={{ fontSize: 28, opacity: 0.5 }} />
+                                <TeamOutlined aria-hidden style={{ fontSize: 28, opacity: 0.5 }} />
                                 <div>{t('noData')}</div>
                               </div>
                             )}
@@ -1752,6 +1808,7 @@ export default function ClientsPage() {
                                         checked={!!row.enable}
                                         size="small"
                                         loading={togglingEmail === row.email}
+                                        aria-label={t('pages.clients.enabled')}
                                         onChange={(next) => onToggleEnable(row, next)}
                                       />
                                       <Dropdown
@@ -1763,7 +1820,8 @@ export default function ClientsPage() {
                                               key: 'qr',
                                               label: (
                                                 <>
-                                                  <QrcodeOutlined /> {t('pages.clients.qrCode')}
+                                                  <QrcodeOutlined aria-hidden />{' '}
+                                                  {t('pages.clients.qrCode')}
                                                 </>
                                               ),
                                               onClick: () => onShowQr(row.email),
@@ -1772,7 +1830,7 @@ export default function ClientsPage() {
                                               key: 'reset',
                                               label: (
                                                 <>
-                                                  <RetweetOutlined />{' '}
+                                                  <RetweetOutlined aria-hidden />{' '}
                                                   {t('pages.inbounds.resetTraffic')}
                                                 </>
                                               ),
@@ -1782,7 +1840,7 @@ export default function ClientsPage() {
                                               key: 'edit',
                                               label: (
                                                 <>
-                                                  <EditOutlined /> {t('edit')}
+                                                  <EditOutlined aria-hidden /> {t('edit')}
                                                 </>
                                               ),
                                               onClick: () => onEdit(row.email),
@@ -1792,7 +1850,7 @@ export default function ClientsPage() {
                                               danger: true,
                                               label: (
                                                 <>
-                                                  <DeleteOutlined /> {t('delete')}
+                                                  <DeleteOutlined aria-hidden /> {t('delete')}
                                                 </>
                                               ),
                                               onClick: () => onDelete(row.email),
@@ -1804,7 +1862,7 @@ export default function ClientsPage() {
                                           type="text"
                                           size="small"
                                           className="row-action-trigger"
-                                          icon={<MoreOutlined />}
+                                          icon={<MoreOutlined aria-hidden />}
                                           aria-label={t('more')}
                                         />
                                       </Dropdown>
@@ -1866,6 +1924,7 @@ export default function ClientsPage() {
             tunnelAllowedIPs={viewingTunnelAllowedIPs}
             isOnline={infoClient ? isOnline(infoClient.email) : false}
             subSettings={subSettings}
+            hosts={hosts}
             onOpenChange={setInfoOpen}
           />
         </LazyMount>
@@ -1876,6 +1935,7 @@ export default function ClientsPage() {
             inboundsById={inboundsById}
             tunnelAllowedIPs={viewingTunnelAllowedIPs}
             subSettings={subSettings}
+            hosts={hosts}
             onOpenChange={setQrOpen}
           />
         </LazyMount>
@@ -1893,8 +1953,15 @@ export default function ClientsPage() {
             open={bulkAdjustOpen}
             count={selectedRowKeys.length}
             onOpenChange={setBulkAdjustOpen}
-            onSubmit={async (addDays, addBytes, flow) => {
-              const msg = await bulkAdjust([...selectedRowKeys], addDays, addBytes, flow);
+            onSubmit={async (addDays, addBytes, flow, limitHwid, adTag) => {
+              const msg = await bulkAdjust(
+                [...selectedRowKeys],
+                addDays,
+                addBytes,
+                flow,
+                limitHwid,
+                adTag,
+              );
               if (msg?.success) {
                 setSelectedRowKeys([]);
                 return msg.obj ?? { adjusted: 0 };

@@ -3,6 +3,7 @@ package sub
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,14 +18,15 @@ import (
 	yaml "github.com/goccy/go-yaml"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 )
 
-func mergeRemoteClashRulesYAML(base map[string]any, raw string) error {
+func mergeRemoteClashRulesYAML(base map[string]any, raw string, allowClientConfig bool) error {
 	var remote map[string]any
 	if err := yaml.Unmarshal([]byte(strings.TrimSpace(raw)), &remote); err != nil {
 		return err
 	}
-	return mergeRemoteClashRules(base, remote)
+	return mergeRemoteClashRules(base, remote, allowClientConfig)
 }
 
 type remoteRoutingRoundTripper func(*http.Request) (*http.Response, error)
@@ -474,7 +476,7 @@ rules:
   - RULE-SET,roscom,PROXY
   - MATCH,PROXY
 `
-	if err := mergeRemoteClashRulesYAML(base, remote); err != nil {
+	if err := mergeRemoteClashRulesYAML(base, remote, false); err != nil {
 		t.Fatalf("merge: %v", err)
 	}
 	proxies, ok := base["proxies"].([]map[string]any)
@@ -519,7 +521,7 @@ func TestMergeRemoteClashRulesKeepsBaseProxyGroupWhenRemoteOmitsIt(t *testing.T)
     proxies: [PROXY]
 rules:
   - MATCH,PROXY
-`); err != nil {
+`, false); err != nil {
 		t.Fatalf("merge: %v", err)
 	}
 	groups, ok := asAnySlice(base["proxy-groups"])
@@ -607,10 +609,7 @@ func TestRemoteRoutingHTTPClientRejectsLoopback(t *testing.T) {
 
 func TestRemoteRoutingPersistedLoadRetriesAfterDatabaseBecomesReady(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
-	if err := database.InitDB(dbPath); err != nil {
-		t.Fatalf("init db: %v", err)
-	}
-	t.Cleanup(func() { _ = database.CloseDB() })
+	dbtest.InitDB(t, dbPath)
 
 	deeplink, err := normalizeHappRouting([]byte(`{"Name":"persisted-after-ready"}`))
 	if err != nil {
@@ -694,7 +693,7 @@ func TestRemoteClashRouteGraphValidation(t *testing.T) {
 				}},
 				"rules": []string{"MATCH,PROXY"},
 			}
-			err := mergeRemoteClashRulesYAML(base, tt.remote)
+			err := mergeRemoteClashRulesYAML(base, tt.remote, false)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("err=%v, want %q", err, tt.wantErr)
 			}
@@ -743,10 +742,39 @@ rules:
 		}},
 		"rules": []string{"MATCH,PROXY"},
 	}
-	if err := mergeRemoteClashRules(base, entry.Clash); err != nil {
+	if err := mergeRemoteClashRules(base, entry.Clash, false); err != nil {
 		t.Fatalf("merge cached document: %v", err)
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("requests=%d, want 1", requests.Load())
+	}
+}
+
+// Aliases decode to one shared value but the encoder writes every copy out, on each Clash
+// request, so a small remote document must not be accepted if it marshals out of bounds.
+func TestNormalizeClashRoutingRefusesWhatMarshalsOutOfBounds(t *testing.T) {
+	var laughs strings.Builder
+	laughs.WriteString("a0: &a0 [\"" + strings.Repeat("x", 64) + "\"]\n")
+	for i := 1; i <= 9; i++ {
+		fmt.Fprintf(&laughs, "a%d: &a%d [", i, i)
+		for j := range 10 {
+			if j > 0 {
+				laughs.WriteString(",")
+			}
+			fmt.Fprintf(&laughs, "*a%d", i-1)
+		}
+		laughs.WriteString("]\n")
+	}
+	bomb := laughs.String() + "rule-providers:\n  p: {type: inline, behavior: domain, payload: *a9}\nrules:\n  - RULE-SET,p,DIRECT\n  - MATCH,DIRECT\n"
+	if _, _, err := normalizeClashRouting([]byte(bomb)); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("alias bomb = %v, want it refused as too large", err)
+	}
+	deep := "rules:\n  - MATCH,DIRECT\nrule-providers:\n  p: {type: inline, behavior: domain, payload: " + strings.Repeat("[", 40) + strings.Repeat("]", 40) + "}\n"
+	if _, _, err := normalizeClashRouting([]byte(deep)); err == nil {
+		t.Fatal("a document nested 40 levels deep was accepted")
+	}
+	anchored := "x: &common {type: http, behavior: domain, interval: 86400}\nrule-providers:\n  ads: {<<: *common, url: \"https://example.com/ads.yaml\"}\nrules:\n  - RULE-SET,ads,REJECT\n  - MATCH,DIRECT\n"
+	if _, _, err := normalizeClashRouting([]byte(anchored)); err != nil {
+		t.Fatalf("an ordinary anchored document was refused: %v", err)
 	}
 }

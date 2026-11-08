@@ -38,6 +38,107 @@ exports[`FinalMaskStreamSettingsSchema fixtures > parses combined byte-stably 1`
 }
 `;
 
+exports[`FinalMaskStreamSettingsSchema fixtures > parses header-custom-variables byte-stably 1`] = `
+{
+  "tcp": [
+    {
+      "settings": {
+        "clients": [
+          [
+            {
+              "capture": "nonce",
+              "delay": 0,
+              "rand": 8,
+              "type": "array",
+            },
+            {
+              "delay": 0,
+              "packet": "HELLO",
+              "type": "str",
+            },
+          ],
+        ],
+        "errors": [
+          [
+            {
+              "delay": 0,
+              "packet": "DENIED",
+              "type": "str",
+            },
+          ],
+        ],
+        "servers": [
+          [
+            {
+              "delay": 0,
+              "reuse": "nonce",
+            },
+            {
+              "delay": 0,
+              "transform": {
+                "args": [
+                  {
+                    "bytes": "OK ",
+                    "type": "str",
+                  },
+                  {
+                    "reuse": "nonce",
+                  },
+                ],
+                "op": "concat",
+              },
+            },
+          ],
+        ],
+      },
+      "type": "header-custom",
+    },
+  ],
+  "udp": [
+    {
+      "settings": {
+        "client": [
+          {
+            "capture": "token",
+            "rand": 8,
+            "type": "array",
+          },
+        ],
+        "mode": "standalone",
+        "server": [
+          {
+            "reuse": "token",
+          },
+        ],
+      },
+      "type": "header-custom",
+    },
+    {
+      "settings": {
+        "ascii": "prefer_entropy",
+        "paddingMax": 7,
+        "paddingMin": 2,
+        "password": "s3cr3t",
+      },
+      "type": "sudoku",
+    },
+    {
+      "settings": {
+        "noise": [
+          {
+            "delay": "10-16",
+            "rand": "10-20",
+            "type": "array",
+          },
+        ],
+        "reset": "60-120",
+      },
+      "type": "noise",
+    },
+  ],
+}
+`;
+
 exports[`FinalMaskStreamSettingsSchema fixtures > parses quic-params byte-stably 1`] = `
 {
   "quicParams": {
@@ -56,6 +157,23 @@ exports[`FinalMaskStreamSettingsSchema fixtures > parses quic-params byte-stably
       "interval": "5-10",
       "ports": "20000-50000",
     },
+  },
+  "tcp": [],
+  "udp": [],
+}
+`;
+
+exports[`FinalMaskStreamSettingsSchema fixtures > parses quic-params-flags byte-stably 1`] = `
+{
+  "quicParams": {
+    "brutalDisableLossCompensation": true,
+    "brutalDown": "100 mbps",
+    "brutalUp": "60 mbps",
+    "congestion": "brutal",
+    "disableChromeParrot": true,
+    "disableGSO": true,
+    "disablePathMTUDiscovery": false,
+    "disableStatelessReset": true,
   },
   "tcp": [],
   "udp": [],
@@ -184,6 +302,25 @@ exports[`FinalMaskStreamSettingsSchema fixtures > parses tcp-mask byte-stably 1`
 }
 `;
 
+exports[`FinalMaskStreamSettingsSchema fixtures > parses udp-hop byte-stably 1`] = `
+{
+  "tcp": [],
+  "udp": [
+    {
+      "settings": {
+        "interval": "5-10",
+        "mode": "intervalremote",
+        "remoteIPs": [
+          "203.0.113.0/24",
+        ],
+        "remotePorts": "20000-50000",
+      },
+      "type": "udphop",
+    },
+  ],
+}
+`;
+
 exports[`FinalMaskStreamSettingsSchema fixtures > parses udp-mask byte-stably 1`] = `
 {
   "tcp": [],
@@ -236,11 +373,31 @@ exports[`FinalMaskStreamSettingsSchema fixtures > parses udp-mask byte-stably 1`
     {
       "settings": {
         "domains": [
-          "example.com:txt",
-          "example.org:a",
+          {
+            "edns0": 1232,
+            "names": [
+              "example.com",
+            ],
+            "types": [
+              16,
+            ],
+          },
+          {
+            "edns0": 1232,
+            "names": [
+              "example.org",
+            ],
+            "types": [
+              1,
+            ],
+          },
         ],
         "resolvers": [
-          "example.com:txt+udp://1.1.1.1:53",
+          {
+            "addrs": [
+              "udp://1.1.1.1:53",
+            ],
+          },
         ],
       },
       "type": "xdns",

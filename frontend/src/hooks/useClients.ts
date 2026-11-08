@@ -4,6 +4,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tansta
 import { HttpUtil, Msg } from '@/utils';
 import { parseMsg } from '@/utils/zodValidate';
 import { keys } from '@/api/queryKeys';
+import { clientManagementPath } from '@/api/client-management';
 import { markLocalInvalidate } from '@/api/invalidationTracker';
 import {
   ClientHydrateSchema,
@@ -50,6 +51,7 @@ const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } } as cons
 
 interface SubSettings {
   enable: boolean;
+  happLinkEnable: boolean;
   subURI: string;
   subJsonURI: string;
   subJsonEnable: boolean;
@@ -96,6 +98,8 @@ export interface ClientSpeedEntry {
   up: number;
   down: number;
 }
+
+type ClientSpeedSource = 'xray' | 'tuic';
 
 type ClientStatRow = ClientTraffic & { email?: string };
 
@@ -266,6 +270,7 @@ export function useClients(options: UseClientsOptions = {}) {
   const subSettings: SubSettings = useMemo(
     () => ({
       enable: !!defaults.subEnable,
+      happLinkEnable: defaults.happLinkEnable === true,
       subURI: (defaults.subURI as string) || '',
       subJsonURI: (defaults.subJsonURI as string) || '',
       subJsonEnable: !!defaults.subJsonEnable,
@@ -275,6 +280,7 @@ export function useClients(options: UseClientsOptions = {}) {
     }),
     [
       defaults.subEnable,
+      defaults.happLinkEnable,
       defaults.subURI,
       defaults.subJsonURI,
       defaults.subJsonEnable,
@@ -296,7 +302,31 @@ export function useClients(options: UseClientsOptions = {}) {
   // settings request still lets the page fall back and render.
   const settingsReady = defaultsQuery.isFetched;
 
-  const [clientSpeed, setClientSpeed] = useState<Record<string, ClientSpeedEntry>>({});
+  const [clientSpeedBySource, setClientSpeedBySource] = useState<
+    Partial<Record<ClientSpeedSource, Record<string, ClientSpeedEntry>>>
+  >({});
+  const clientSpeedExpiryTimers = useRef<Partial<Record<ClientSpeedSource, number>>>({});
+  const clientSpeedSourceVersions = useRef<Record<ClientSpeedSource, number>>({ xray: 0, tuic: 0 });
+  const clientSpeed = useMemo(() => {
+    const combined: Record<string, ClientSpeedEntry> = {};
+    for (const source of Object.values(clientSpeedBySource)) {
+      if (!source) continue;
+      for (const [email, speed] of Object.entries(source)) {
+        const current = combined[email] ?? { up: 0, down: 0 };
+        combined[email] = { up: current.up + speed.up, down: current.down + speed.down };
+      }
+    }
+    return combined;
+  }, [clientSpeedBySource]);
+
+  useEffect(
+    () => () => {
+      for (const timer of Object.values(clientSpeedExpiryTimers.current)) {
+        if (timer !== undefined) window.clearTimeout(timer);
+      }
+    },
+    [],
+  );
   const summary = listQuery.data?.summary ?? DEFAULT_SUMMARY;
 
   const invalidateAll = useCallback(() => {
@@ -314,7 +344,7 @@ export function useClients(options: UseClientsOptions = {}) {
 
   const hydrate = useCallback(async (email: string): Promise<ClientHydrate | null> => {
     if (!email) return null;
-    const msg = await HttpUtil.get(`/panel/api/clients/get/${encodeURIComponent(email)}`);
+    const msg = await HttpUtil.get(clientManagementPath('get', email));
     if (!msg?.success || !msg.obj) return null;
     const validated = parseMsg(msg, ClientHydrateSchema, 'clients/get');
     return validated.obj;
@@ -346,7 +376,7 @@ export function useClients(options: UseClientsOptions = {}) {
 
   const updateMut = useMutation({
     mutationFn: ({ email, client }: { email: string; client: unknown }) =>
-      HttpUtil.post(`/panel/api/clients/update/${encodeURIComponent(email)}`, client, JSON_HEADERS),
+      HttpUtil.post(clientManagementPath('update', email), client, JSON_HEADERS),
     onSuccess: (msg) => {
       if (msg?.success) invalidateAll();
     },
@@ -354,9 +384,8 @@ export function useClients(options: UseClientsOptions = {}) {
 
   const removeMut = useMutation({
     mutationFn: ({ email, keepTraffic }: { email: string; keepTraffic?: boolean }) => {
-      const url = keepTraffic
-        ? `/panel/api/clients/del/${encodeURIComponent(email)}?keepTraffic=1`
-        : `/panel/api/clients/del/${encodeURIComponent(email)}`;
+      let url = clientManagementPath('del', email);
+      if (keepTraffic) url += `${url.includes('?') ? '&' : '?'}keepTraffic=1`;
       return HttpUtil.post(url);
     },
     onSuccess: (msg) => {
@@ -392,7 +421,9 @@ export function useClients(options: UseClientsOptions = {}) {
       emails: string[];
       addDays: number;
       addBytes: number;
-      flow: string;
+      flow?: string;
+      limitHwid?: number | null;
+      adTag?: string;
     }): Promise<Msg<BulkAdjustResult>> => {
       const raw = await HttpUtil.post('/panel/api/clients/bulkAdjust', payload, JSON_HEADERS);
       return parseMsg(raw, BulkAdjustResultSchema, 'clients/bulkAdjust');
@@ -561,9 +592,16 @@ export function useClients(options: UseClientsOptions = {}) {
     [bulkCreateMut],
   );
   const bulkAdjust = useCallback(
-    (emails: string[], addDays: number, addBytes: number, flow = '') => {
+    (
+      emails: string[],
+      addDays: number,
+      addBytes: number,
+      flow = '',
+      limitHwid?: number | null,
+      adTag?: string,
+    ) => {
       if (!Array.isArray(emails) || emails.length === 0) return Promise.resolve(null);
-      return bulkAdjustMut.mutateAsync({ emails, addDays, addBytes, flow });
+      return bulkAdjustMut.mutateAsync({ emails, addDays, addBytes, flow, limitHwid, adTag });
     },
     [bulkAdjustMut],
   );
@@ -684,7 +722,10 @@ export function useClients(options: UseClientsOptions = {}) {
         tgId: Number(base.tgId) || 0,
         reset: Number(base.reset) || 0,
         resetDay: Number(base.resetDay) || 0,
+        resetWeekday: Number(base.resetWeekday) || 0,
         resetMax: Number(base.resetMax) || 0,
+        trafficReset: base.trafficReset || 'never',
+        trafficResetDay: Number(base.trafficResetDay) || 1,
         group: base.group || '',
         comment: base.comment || '',
         enable: !!enable,
@@ -710,6 +751,8 @@ export function useClients(options: UseClientsOptions = {}) {
       const p = payload as {
         onlineClients?: string[];
         clientTraffics?: { email: string; up: number; down: number }[];
+        clientTrafficSource?: 'xray' | 'tuic';
+        clientTrafficIntervalMs?: number;
       };
       if (Array.isArray(p.onlineClients)) {
         queryClient.setQueryData(keys.clients.onlines(), p.onlineClients);
@@ -721,17 +764,45 @@ export function useClients(options: UseClientsOptions = {}) {
         // dropped and an unchanged result returns the previous object — which lets
         // React bail out of the update instead of re-rendering the table.
         const next: Record<string, ClientSpeedEntry> = {};
+        const source = p.clientTrafficSource === 'tuic' ? 'tuic' : 'xray';
+        const sampleIntervalMs =
+          typeof p.clientTrafficIntervalMs === 'number' &&
+          Number.isFinite(p.clientTrafficIntervalMs) &&
+          p.clientTrafficIntervalMs > 0
+            ? p.clientTrafficIntervalMs
+            : TRAFFIC_POLL_INTERVAL_S * 1000;
+        const sampleIntervalSeconds = sampleIntervalMs / 1000;
         for (const ct of p.clientTraffics) {
           if (!ct || !ct.email) continue;
           const up = ct.up || 0;
           const down = ct.down || 0;
           if (up === 0 && down === 0) continue;
+          const current = next[ct.email] ?? { up: 0, down: 0 };
           next[ct.email] = {
-            up: up / TRAFFIC_POLL_INTERVAL_S,
-            down: down / TRAFFIC_POLL_INTERVAL_S,
+            up: current.up + up / sampleIntervalSeconds,
+            down: current.down + down / sampleIntervalSeconds,
           };
         }
-        setClientSpeed((prev) => (sameSpeedMap(prev, next) ? prev : next));
+        setClientSpeedBySource((prev) =>
+          sameSpeedMap(prev[source] ?? {}, next) ? prev : { ...prev, [source]: next },
+        );
+
+        const version = ++clientSpeedSourceVersions.current[source];
+        const previousTimer = clientSpeedExpiryTimers.current[source];
+        if (previousTimer !== undefined) window.clearTimeout(previousTimer);
+        clientSpeedExpiryTimers.current[source] = window.setTimeout(
+          () => {
+            if (clientSpeedSourceVersions.current[source] !== version) return;
+            delete clientSpeedExpiryTimers.current[source];
+            setClientSpeedBySource((prev) => {
+              if (!prev[source]) return prev;
+              const nextSources = { ...prev };
+              delete nextSources[source];
+              return nextSources;
+            });
+          },
+          Math.min(sampleIntervalMs * 2, 120_000),
+        );
       }
     },
     [queryClient],

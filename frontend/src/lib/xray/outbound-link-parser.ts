@@ -1,5 +1,8 @@
 import { Base64 } from '@/utils';
 
+import { normalizeUdpHop, upgradeLegacyUdpHop } from './udphop-mask';
+import { upgradeLegacyXdnsMasks } from './xdns-mask';
+
 // Focused share-link parser for the OutboundFormModal's link-import
 // helper. Each parser returns a wire-shape outbound record (the same
 // shape OutboundsTab.tsx stores in templateSettings.outbounds[]) or
@@ -219,6 +222,15 @@ function applyTransportParams(stream: Raw, params: URLSearchParams): void {
       applyXhttpStringFromParams(xhttp, params);
       break;
     }
+    case 'kcp': {
+      // mtu/tti on kcpSettings; header/seed via applyMkcpLegacyFromShare.
+      const kcp = stream.kcpSettings as Raw;
+      const mtu = kcpParamInRange(params.get('mtu'), KCP_MIN_MTU, KCP_MAX_MTU);
+      if (mtu !== null) kcp.mtu = mtu;
+      const tti = kcpParamInRange(params.get('tti'), KCP_MIN_TTI, KCP_MAX_TTI);
+      if (tti !== null) kcp.tti = tti;
+      break;
+    }
     case 'tcp':
       // vless/trojan TCP HTTP camouflage rides on header=http+host+path
       if (params.get('headerType') === 'http' || params.get('type') === 'http') {
@@ -236,21 +248,79 @@ function applyTransportParams(stream: Raw, params: URLSearchParams): void {
   }
 }
 
+// mKCP bounds mirror xray-core's KCPConfig.Build checks (a value outside them fails
+// the whole config load); mtu's ceiling is the int32 that fits its uint32 field.
+const KCP_MIN_MTU = 21;
+const KCP_MAX_MTU = 0x7fffffff;
+const KCP_MIN_TTI = 10;
+const KCP_MAX_TTI = 1000;
+
+// Decimal digits only, like the Go importer's strconv.Atoi; anything else keeps
+// buildStream's default.
+function kcpParamInRange(raw: string | null, min: number, max: number): number | null {
+  if (raw === null || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : null;
+}
+
+const kcpHeaderTypeToMask: Record<string, string> = {
+  dns: 'dns',
+  dtls: 'dtls',
+  srtp: 'srtp',
+  utp: 'utp',
+  'wechat-video': 'wechat',
+  wireguard: 'wireguard',
+};
+
 // The inbound link emits the entire finalmask object as a JSON-encoded
-// `fm` query param. Decode and attach to streamSettings so udpHop /
-// quicParams / tcp+udp masks round-trip on outbound import.
+// `fm` query param. Decode and attach to streamSettings so quicParams and the
+// tcp+udp masks round-trip on outbound import; a legacy udpHop becomes the mask.
 function applyFinalMaskParam(stream: Raw, params: URLSearchParams): void {
   const fm = params.get('fm');
-  if (!fm) return;
-  try {
-    const parsed = JSON.parse(fm) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object') {
-      sanitizeFinalMaskQuicParams(parsed);
-      stream.finalmask = parsed;
+  if (fm) {
+    try {
+      const parsed = JSON.parse(fm) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object') {
+        sanitizeFinalMaskQuicParams(parsed);
+        if (Array.isArray(parsed.udp)) parsed.udp = upgradeLegacyXdnsMasks(parsed.udp).next;
+        stream.finalmask = normalizeUdpHop(upgradeLegacyUdpHop(parsed).next).next;
+      }
+    } catch {
+      // malformed fm — leave streamSettings.finalmask absent
     }
-  } catch {
-    // malformed fm — leave streamSettings.finalmask absent
   }
+  applyMkcpLegacyFromShare(stream, params);
+}
+
+/** Restore headerType/seed into finalmask.udp mkcp-legacy; fm= mkcp-legacy wins. */
+function applyMkcpLegacyFromShare(stream: Raw, params: URLSearchParams): void {
+  let headerType = (params.get('headerType') ?? '').trim();
+  const seed = params.get('seed') ?? '';
+  if (headerType === 'none') headerType = '';
+  if (!headerType && !seed) return;
+  const network = stream.network;
+  if (typeof network === 'string' && network && network !== 'kcp') return;
+
+  let maskHeader = '';
+  if (headerType) {
+    if (!Object.hasOwn(kcpHeaderTypeToMask, headerType)) return;
+    maskHeader = kcpHeaderTypeToMask[headerType];
+  }
+
+  const finalmask = (stream.finalmask as Raw) ?? {};
+  const udp = Array.isArray(finalmask.udp) ? [...(finalmask.udp as unknown[])] : [];
+  if (udp.some((m) => (m as Raw)?.type === 'mkcp-legacy')) return;
+
+  // One mask per field, seed first: MkcpLegacy.Build ignores value once header is
+  // set, and the chain puts the last mask outermost on the wire (header around cipher).
+  if (seed) udp.push(mkcpLegacyMask('', seed));
+  if (maskHeader) udp.push(mkcpLegacyMask(maskHeader, ''));
+  finalmask.udp = udp;
+  stream.finalmask = finalmask;
+}
+
+function mkcpLegacyMask(header: string, value: string): Raw {
+  return { type: 'mkcp-legacy', settings: { header, value } };
 }
 
 function ensureFinalMask(stream: Raw): Raw {
@@ -311,21 +381,19 @@ function applyHysteria2Obfs(stream: Raw, params: URLSearchParams): void {
   finalmask.udp = [...udp, { type: 'salamander', settings }];
 }
 
-// Rebuild the UDP port-hopping range from the standard mport param, which the
-// generator emits as finalmask.quicParams.udpHop.ports. A range already supplied
-// via fm= wins; the client-side interval falls back to the panel's default.
+// Rebuild the UDP port-hopping range from the standard mport param. xray-core
+// 26.9.9 replaced finalmask.quicParams.udpHop with a 'udphop' UDP mask, whose
+// intervalremote mode is what the old key used to do; an fm= mask wins.
 function applyHysteria2Hop(stream: Raw, params: URLSearchParams): void {
   const ports = firstParam(params, 'mport');
   if (!ports) return;
   const finalmask = ensureFinalMask(stream);
-  const quicParams = (
-    finalmask.quicParams && typeof finalmask.quicParams === 'object'
-      ? finalmask.quicParams
-      : (finalmask.quicParams = {})
-  ) as Raw;
-  const existingHop = quicParams.udpHop as Raw | undefined;
-  if (existingHop && typeof existingHop.ports === 'string' && existingHop.ports.length > 0) return;
-  quicParams.udpHop = { ports, interval: '5-10' };
+  const udp = Array.isArray(finalmask.udp) ? (finalmask.udp as Raw[]) : [];
+  if (udp.some((mask) => (mask as Raw | undefined)?.type === 'udphop')) return;
+  finalmask.udp = [
+    ...udp,
+    { type: 'udphop', settings: { mode: 'intervalremote', interval: '5-10', remotePorts: ports } },
+  ];
 }
 
 const QUIC_PARAMS_NUMERIC_KEYS = [
@@ -390,6 +458,27 @@ function sanitizeFinalMaskQuicParams(parsed: Record<string, unknown>): void {
   }
 }
 
+// The panel exports tcp/http obfuscation as the SIP002 obfs-local plugin only,
+// so the header it stands for has to be rebuilt before the transport is applied.
+function applyObfsLocalPluginParams(params: URLSearchParams): void {
+  if (params.get('headerType') || params.get('type') === 'http') return;
+  const parts = (params.get('plugin') ?? '').split(';');
+  if (parts[0] !== 'obfs-local') return;
+  let obfs = '';
+  let host = '';
+  for (const part of parts.slice(1)) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const key = part.slice(0, eq);
+    if (key === 'obfs') obfs = part.slice(eq + 1);
+    else if (key === 'obfs-host') host = part.slice(eq + 1);
+  }
+  if (obfs !== 'http') return;
+  params.set('type', 'tcp');
+  params.set('headerType', 'http');
+  if (host) params.set('host', host);
+}
+
 function applySecurityParams(stream: Raw, params: URLSearchParams): void {
   if (stream.security === 'tls') {
     const tls = stream.tlsSettings as Raw;
@@ -400,6 +489,8 @@ function applySecurityParams(stream: Raw, params: URLSearchParams): void {
     tls.echConfigList = params.get('ech') ?? '';
     tls.verifyPeerCertByName = params.get('vcn') ?? '';
     tls.pinnedPeerCertSha256 = params.get('pcs') ?? '';
+    const cs = params.get('cs');
+    if (cs) tls.cipherSuites = cs;
   } else if (stream.security === 'reality') {
     const reality = stream.realitySettings as Raw;
     reality.serverName = params.get('sni') ?? '';
@@ -454,12 +545,31 @@ export function parseVmessLink(link: string): Raw | null {
       xhttp.path = json.path ?? '/';
       if (json.mode) xhttp.mode = json.mode;
       applyXhttpStringFromJson(xhttp, json);
+    } else if (network === 'kcp') {
+      applyTransportParams(
+        stream,
+        new URLSearchParams({ mtu: String(json.mtu ?? ''), tti: String(json.tti ?? '') }),
+      );
     }
+    // The vmess object carries fm as-is and the mKCP header and seed as type and path.
+    const maskParams = new URLSearchParams();
+    if (typeof json.fm === 'string') maskParams.set('fm', json.fm);
+    if (network === 'kcp') {
+      if (typeof json.type === 'string') maskParams.set('headerType', json.type);
+      if (typeof json.path === 'string') maskParams.set('seed', json.path);
+    }
+    applyFinalMaskParam(stream, maskParams);
     if (security === 'tls') {
       const tls = stream.tlsSettings as Raw;
       tls.serverName = json.sni ?? '';
       tls.fingerprint = json.fp ?? '';
       if (json.alpn) tls.alpn = (json.alpn as string).split(',');
+      // The vmess object names the certificate checks the url-param protocols
+      // pass through applySecurityParams, under the same short names.
+      if (typeof json.ech === 'string') tls.echConfigList = json.ech;
+      if (typeof json.vcn === 'string') tls.verifyPeerCertByName = json.vcn;
+      if (typeof json.pcs === 'string') tls.pinnedPeerCertSha256 = json.pcs;
+      if (typeof json.cs === 'string') tls.cipherSuites = json.cs;
     }
 
     const port = Number(json.port) || 443;
@@ -549,6 +659,8 @@ export function parseShadowsocksLink(link: string): Raw | null {
   // Two link shapes coexist:
   //   modern:  ss://base64(method:password)@host:port#remark
   //   legacy:  ss://base64(method:password@host:port)#remark
+  // Query may carry Xray-native stream params (type/security/sni/alpn/fp)
+  // emitted by the SS share-link generator — preserve them like trojan/vless.
   // Try modern first; fall back to legacy decode of the whole userinfo+host.
   let userInfo: string;
   let host: string;
@@ -564,6 +676,7 @@ export function parseShadowsocksLink(link: string): Raw | null {
     }
   }
   const queryIndex = linkNoHash.indexOf('?');
+  const rawQuery = queryIndex >= 0 ? linkNoHash.slice(queryIndex + 1) : '';
   const core = queryIndex >= 0 ? linkNoHash.slice(0, queryIndex) : linkNoHash;
   const atIndex = core.indexOf('@');
   if (atIndex >= 0) {
@@ -583,7 +696,7 @@ export function parseShadowsocksLink(link: string): Raw | null {
         userInfo = rawUserInfo;
       }
     }
-    const hostPort = core.slice(atIndex + 1);
+    const hostPort = core.slice(atIndex + 1).replace(/\/+$/, '');
     const colon = hostPort.lastIndexOf(':');
     if (colon < 0) return null;
     host = hostPort.slice(0, colon);
@@ -607,12 +720,21 @@ export function parseShadowsocksLink(link: string): Raw | null {
   const sep = userInfo.indexOf(':');
   const method = sep < 0 ? '2022-blake3-aes-128-gcm' : userInfo.slice(0, sep);
   const password = sep < 0 ? userInfo : userInfo.slice(sep + 1);
+  const params = new URLSearchParams(rawQuery);
+  applyObfsLocalPluginParams(params);
+  const network = params.get('type') ?? 'tcp';
+  const security = (params.get('security') ?? 'none') as string;
+  const stream = buildStream(network, security);
+  applyTransportParams(stream, params);
+  applySecurityParams(stream, params);
+  applyFinalMaskParam(stream, params);
   return {
     protocol: 'shadowsocks',
     tag: remark,
     settings: {
       servers: [{ address: host, port, password, method }],
     },
+    streamSettings: stream,
   };
 }
 
@@ -737,12 +859,31 @@ export function parseWireguardLink(link: string): Raw | null {
 export function parseOutboundLink(link: string): Raw | null {
   const trimmed = link.trim();
   if (!trimmed) return null;
-  return (
+  const outbound =
     parseVmessLink(trimmed) ??
     parseVlessLink(trimmed) ??
     parseTrojanLink(trimmed) ??
     parseShadowsocksLink(trimmed) ??
     parseHysteria2Link(trimmed) ??
-    parseWireguardLink(trimmed)
-  );
+    parseWireguardLink(trimmed);
+  if (outbound) dropHostLocalKeys(outbound);
+  return outbound;
+}
+
+// Keys that redirect the core's dial or name files on the importing host; extra=, fm= and
+// vmess JSON copy provider objects verbatim, and the core binds keys case-folded.
+const HOST_LOCAL_KEYS = new Set(['dialerproxy', 'certificatefile', 'keyfile', 'masterkeylog']);
+
+function dropHostLocalKeys(value: unknown): void {
+  if (Array.isArray(value)) {
+    value.forEach(dropHostLocalKeys);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const obj = value as Raw;
+  for (const key of Object.keys(obj)) {
+    // Upper-casing first folds the long s and the Kelvin sign the way Go's decoder does.
+    if (HOST_LOCAL_KEYS.has(key.toUpperCase().toLowerCase())) delete obj[key];
+    else dropHostLocalKeys(obj[key]);
+  }
 }

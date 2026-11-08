@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Alert, Button, Form, Input, Modal, Select, Space, Spin, Typography, message } from 'antd';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 
+import { XrayConfigPayloadSchema } from '@/schemas/xray';
+import { isOutboundProtocol } from '@/schemas/primitives';
 import { HttpUtil } from '@/utils';
 
 interface GeodataAssetRow {
@@ -17,8 +19,8 @@ interface GeodataSectionProps {
 }
 
 const DEFAULT_CRON = '0 4 * * *';
-// Xray resolves `file` inside its asset directory; plain file names only.
-const FILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+// Xray resolves `file` inside its asset directory; since 26.10.29 a scheduled one must be .dat.
+const FILE_NAME_PATTERN = /^[A-Za-z0-9._-]+\.dat$/i;
 
 function fileNameFromUrl(url: string): string {
   try {
@@ -31,12 +33,14 @@ function fileNameFromUrl(url: string): string {
 
 export default function GeodataSection({ active, onBusy, onClose }: GeodataSectionProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const [modal, modalContextHolder] = Modal.useModal();
   const [messageApi, messageContextHolder] = message.useMessage();
   const [loading, setLoading] = useState(false);
   const [cron, setCron] = useState(DEFAULT_CRON);
   const [outbound, setOutbound] = useState<string | undefined>(undefined);
   const [rows, setRows] = useState<GeodataAssetRow[]>([]);
+  const [standardSources, setStandardSources] = useState<GeodataAssetRow[]>([]);
   const [outboundTags, setOutboundTags] = useState<string[]>([]);
   const [template, setTemplate] = useState<Record<string, unknown> | null>(null);
   const outboundTestUrlRef = useRef('');
@@ -45,8 +49,10 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
     try {
       const msg = await HttpUtil.post('/panel/api/xray/', undefined, { silent: true });
       if (!msg?.success || typeof msg.obj !== 'string') return;
-      const payload = JSON.parse(msg.obj) as Record<string, unknown>;
-      const next = (payload.xraySetting || {}) as Record<string, unknown>;
+      const parsed = XrayConfigPayloadSchema.safeParse(JSON.parse(msg.obj));
+      if (!parsed.success) return;
+      const payload = parsed.data;
+      const next = payload.xraySetting as Record<string, unknown>;
       setTemplate(next);
       outboundTestUrlRef.current =
         typeof payload.outboundTestUrl === 'string' ? payload.outboundTestUrl : '';
@@ -62,6 +68,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
       setOutbound(
         typeof geodata.outbound === 'string' && geodata.outbound ? geodata.outbound : undefined,
       );
+      setStandardSources(payload.geodataSources ?? []);
 
       // Download outbound candidates: template outbounds + subscription outbounds.
       // Skip blackhole outbounds — routing a download through one just drops it.
@@ -70,7 +77,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
       for (const o of outbounds) {
         if (!o || typeof o !== 'object') continue;
         const rec = o as Record<string, unknown>;
-        if (rec.protocol === 'blackhole') continue;
+        if (isOutboundProtocol(rec, 'blackhole')) continue;
         const tag = rec.tag;
         if (typeof tag === 'string' && tag) tags.add(tag);
       }
@@ -104,6 +111,13 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
     setRows((prev) =>
       prev.map((r, i) => (i === index && !r.file ? { ...r, file: fileNameFromUrl(r.url) } : r)),
     );
+  }
+
+  function addStandardSources() {
+    setRows((prev) => {
+      const files = new Set(prev.map((row) => row.file));
+      return [...prev, ...standardSources.filter((source) => !files.has(source.file))];
+    });
   }
 
   function save() {
@@ -164,18 +178,28 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
     <div>
       {modalContextHolder}
       {messageContextHolder}
-      <Spin spinning={loading}>
+      <Spin aria-live="off" spinning={loading}>
         <Alert type="info" className="mb-12" title={t('pages.index.geodataHint')} showIcon />
         <Form layout="vertical">
-          <Form.Item label={t('pages.index.geodataCron')} style={{ marginBottom: 8 }}>
+          <Form.Item
+            htmlFor={`${uid}-cron`}
+            label={t('pages.index.geodataCron')}
+            style={{ marginBottom: 8 }}
+          >
             <Input
+              id={`${uid}-cron`}
               value={cron}
               placeholder={DEFAULT_CRON}
               onChange={(e) => setCron(e.target.value)}
             />
           </Form.Item>
-          <Form.Item label={t('pages.index.geodataOutbound')} style={{ marginBottom: 8 }}>
+          <Form.Item
+            htmlFor={`${uid}-outbound`}
+            label={t('pages.index.geodataOutbound')}
+            style={{ marginBottom: 8 }}
+          >
             <Select
+              id={`${uid}-outbound`}
               style={{ width: '100%' }}
               allowClear
               value={outbound}
@@ -191,6 +215,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
           {rows.map((row, i) => (
             <Space.Compact key={i} style={{ width: '100%' }}>
               <Input
+                aria-label={`URL ${i + 1}`}
                 style={{ width: '60%' }}
                 placeholder="https://example.com/geosite_custom.dat"
                 value={row.url}
@@ -198,6 +223,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
                 onBlur={() => onUrlBlur(i)}
               />
               <Input
+                aria-label={`${t('pages.index.geodataFile')} ${i + 1}`}
                 style={{ width: '40%' }}
                 placeholder={t('pages.index.geodataFile')}
                 value={row.file}
@@ -205,17 +231,20 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
               />
               <Button
                 aria-label={t('delete')}
-                icon={<DeleteOutlined />}
+                icon={<DeleteOutlined aria-hidden />}
                 onClick={() => setRows((p) => p.filter((_, j) => j !== i))}
               />
             </Space.Compact>
           ))}
           <div className="actions-row">
             <Button
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               onClick={() => setRows((p) => [...p, { url: '', file: '' }])}
             >
               {t('pages.index.geodataAddFile')}
+            </Button>
+            <Button onClick={addStandardSources} disabled={standardSources.length === 0}>
+              {t('pages.index.geodataUseStandardSources')}
             </Button>
             <Button type="primary" onClick={save} disabled={loading || !template}>
               {t('pages.index.geodataSaveRestart')}

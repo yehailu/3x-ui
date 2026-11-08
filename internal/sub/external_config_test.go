@@ -3,6 +3,7 @@ package sub
 import (
 	"encoding/base64"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -155,7 +156,7 @@ func TestLinkDisplayName(t *testing.T) {
 
 func TestClashProxyFromExternalTrojanReality(t *testing.T) {
 	link := "trojan://provider-pass@37.27.201.56:8443?type=tcp&security=reality&sni=aws.amazon.com&pbk=PBK&sid=298b44&fp=chrome#srv"
-	svc := NewSubClashService(false, "", NewSubService(""))
+	svc := NewSubClashService(false, "", false, NewSubService(""))
 	proxy := svc.clashProxyFromExternal(link, "DE-Provider")
 	if proxy == nil {
 		t.Fatal("expected a clash proxy, got nil")
@@ -174,5 +175,17 @@ func TestClashProxyFromExternalTrojanReality(t *testing.T) {
 	}
 	if proxy["tls"] != true {
 		t.Fatalf("expected reality→tls true, got %v", proxy["tls"])
+	}
+}
+
+// Only server links pass: an app deeplink or a plain URL from the provider would reach the
+// subscriber's app as a directive (a routing profile, an import) the operator never chose.
+func TestDecodeSubscriptionBodyKeepsOnlyServerShareLinks(t *testing.T) {
+	body := []byte("VLESS://u@a:1#a\nincy://autorouting/onadd/https://p.example/r.json\nhttps://p.example/page\n" +
+		"happ://routing/add/x\nvpn://payload\ntuic://u:p@a:1#t\nhy2://p@a:1#h\nnot a link://x\n")
+	got := decodeSubscriptionBody(body)
+	want := []string{"VLESS://u@a:1#a", "vpn://payload", "tuic://u:p@a:1#t", "hy2://p@a:1#h"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("decoded links = %q, want %q", got, want)
 	}
 }

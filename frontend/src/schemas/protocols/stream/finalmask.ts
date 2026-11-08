@@ -10,7 +10,9 @@ import { z } from 'zod';
 // here would dwarf the rest of the stream module without buying anything
 // the safety net doesn't already cover.
 
-export const TcpMaskTypeSchema = z.enum(['fragment', 'sudoku', 'header-custom', 'xmc']);
+// 'filter' (xray-core 26.10.21) screens a listener's source IPs, so only the server-side
+// editors offer it and the share-link generators drop it.
+export const TcpMaskTypeSchema = z.enum(['fragment', 'sudoku', 'header-custom', 'xmc', 'filter']);
 export type TcpMaskType = z.infer<typeof TcpMaskTypeSchema>;
 
 export const TcpMaskSchema = z.object({
@@ -19,6 +21,8 @@ export const TcpMaskSchema = z.object({
 });
 export type TcpMask = z.infer<typeof TcpMaskSchema>;
 
+// 'udphop' is client-only in xray-core (it refuses to wrap a server socket),
+// so only the client-side mask editors offer it.
 export const UdpMaskTypeSchema = z.enum([
   'salamander',
   'mkcp-legacy',
@@ -28,6 +32,8 @@ export const UdpMaskTypeSchema = z.enum([
   'noise',
   'sudoku',
   'realm',
+  'udphop',
+  'filter',
 ]);
 export type UdpMaskType = z.infer<typeof UdpMaskTypeSchema>;
 
@@ -43,9 +49,9 @@ export type QuicCongestion = z.infer<typeof QuicCongestionSchema>;
 export const BbrProfileSchema = z.enum(['conservative', 'standard', 'aggressive']);
 export type BbrProfile = z.infer<typeof BbrProfileSchema>;
 
-// udpHop randomizes the QUIC port between a range every `interval` seconds
-// to dodge port-based blocking. Both fields are dash-range strings on the
-// wire (e.g. '20000-50000', '5-10'). preprocess coerces legacy DB rows
+// udpHop declares the hop range advertised to clients as `mport`. xray-core
+// 26.9.9 moved actual hopping to the 'udphop' UDP mask and ignores this key,
+// which was always inert server-side. preprocess coerces legacy DB rows
 // where interval was stored as a number (UI bug — see B19 in commit history).
 const StringRangeSchema = z.preprocess((v) => (typeof v === 'number' ? String(v) : v), z.string());
 
@@ -61,6 +67,7 @@ export const QuicParamsSchema = z.object({
   debug: z.boolean().optional(),
   brutalUp: z.string().optional(),
   brutalDown: z.string().optional(),
+  brutalDisableLossCompensation: z.boolean().optional(),
   udpHop: QuicUdpHopSchema.optional(),
   initStreamReceiveWindow: z.number().int().min(0).optional(),
   maxStreamReceiveWindow: z.number().int().min(0).optional(),
@@ -69,7 +76,10 @@ export const QuicParamsSchema = z.object({
   maxIdleTimeout: z.number().int().min(4).max(120).optional(),
   keepAlivePeriod: z.number().int().min(2).max(60).optional(),
   disablePathMTUDiscovery: z.boolean().optional(),
+  disableChromeParrot: z.boolean().optional(),
+  disableGSO: z.boolean().optional(),
   maxIncomingStreams: z.number().int().min(8).optional(),
+  disableStatelessReset: z.boolean().optional(),
 });
 export type QuicParams = z.infer<typeof QuicParamsSchema>;
 

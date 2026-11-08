@@ -901,6 +901,7 @@ export class LanguageManager {
     { name: 'Український', value: 'uk-UA', icon: '🇺🇦' },
     { name: 'Türkçe', value: 'tr-TR', icon: '🇹🇷' },
     { name: 'Português', value: 'pt-BR', icon: '🇧🇷' },
+    { name: 'Slovenčina', value: 'sk-SK', icon: '🇸🇰' },
   ];
 
   static getLanguage(scope: LanguageScope = 'panel'): string {
@@ -931,6 +932,7 @@ export class LanguageManager {
         ['uk', LanguageManager.supportedLanguages[10].value],
         ['tr', LanguageManager.supportedLanguages[11].value],
         ['pt', LanguageManager.supportedLanguages[12].value],
+        ['sk', LanguageManager.supportedLanguages[13].value],
       ];
 
       simularLangs.forEach((pair) => {
@@ -967,10 +969,12 @@ export class LanguageManager {
 }
 
 export class FileManager {
+  // Typed text/plain, Android's MediaStore saves peer.conf as peer.conf.txt;
+  // octet-stream carries no extension of its own, so the given name is kept.
   static downloadTextFile(
     content: BlobPart,
     filename: string = 'file.txt',
-    options: BlobPropertyBag = { type: 'text/plain' },
+    options: BlobPropertyBag = { type: 'application/octet-stream' },
   ): void {
     const link = window.document.createElement('a');
     link.download = filename;

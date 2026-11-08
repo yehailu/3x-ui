@@ -1,9 +1,11 @@
 package amneziawgnet
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 )
@@ -253,5 +255,118 @@ func TestSocks5ReceiveRejectsTruncatedReplies(t *testing.T) {
 				t.Fatal("receive accepted a malformed datagram instead of returning an error")
 			}
 		})
+	}
+}
+
+// TestNewSocks5UDPSessionGivesUpOnSilentServer pins that a control connection
+// the kernel accepts but nobody answers returns within the associate deadline
+// instead of parking Handle -- and with it the tunnel's delivery path -- forever.
+func TestNewSocks5UDPSessionGivesUpOnSilentServer(t *testing.T) {
+	// Never accepted: the backlog completes the TCP handshake, the greeting
+	// lands in the socket buffer, and no reply ever comes -- a hung Xray.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	saved := socks5AssociateTimeout
+	socks5AssociateTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { socks5AssociateTimeout = saved })
+
+	type result struct {
+		sess *socks5UDPSession
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sess, err := newSocks5UDPSession(ln.Addr().String(), "peer@example", "x")
+		done <- result{sess, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			got.sess.Close()
+			t.Fatal("associate succeeded against a server that never answered")
+		}
+		if !errors.Is(got.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("associate error = %v, want one wrapping os.ErrDeadlineExceeded", got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("newSocks5UDPSession still blocked 2s past the associate deadline: a silent SOCKS5 server parks the tunnel's delivery path")
+	}
+}
+
+// startFakeSocks5UDP serves just enough no-auth SOCKS5 for UDP ASSOCIATE to
+// succeed, pointing every association at one UDP socket nobody reads.
+func startFakeSocks5UDP(t *testing.T) string {
+	t.Helper()
+	sink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	t.Cleanup(func() { _ = sink.Close() })
+	port := sink.LocalAddr().(*net.UDPAddr).Port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				var greeting [4]byte
+				var associate [10]byte
+				if _, err := io.ReadFull(c, greeting[:]); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte{0x05, 0x00})
+				if _, err := io.ReadFull(c, associate[:]); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(port >> 8), byte(port)})
+				_, _ = io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// Each fresh tunnel source port bought a SOCKS5 association and a UDP socket with no
+// per-peer bound, so one client could take the host's UDP ports from everyone.
+func TestUDPRelayCapsSessionsPerPeer(t *testing.T) {
+	relay := NewUDPRelay(SocksRelay{Addr: startFakeSocks5UDP(t), Password: "x"}, nil)
+	defer relay.Close()
+	dst := netip.MustParseAddrPort("192.0.2.1:53")
+
+	for n := 1; n < maxUDPSessionsPerPeer; n++ {
+		relay.slots.acquire("greedy")
+	}
+	relay.Handle(netip.MustParseAddrPort("10.8.1.5:1000"), dst, "greedy", []byte("x"))
+	relay.Handle(netip.MustParseAddrPort("10.8.1.5:1001"), dst, "greedy", []byte("x"))
+	relay.Handle(netip.MustParseAddrPort("10.8.1.6:1000"), dst, "modest", []byte("x"))
+
+	relay.mu.Lock()
+	_, last := relay.sessions[netip.MustParseAddrPort("10.8.1.5:1000")]
+	_, excess := relay.sessions[netip.MustParseAddrPort("10.8.1.5:1001")]
+	_, other := relay.sessions[netip.MustParseAddrPort("10.8.1.6:1000")]
+	relay.mu.Unlock()
+	if !last || excess || !other {
+		t.Fatalf("sessions: greedy's last allowed = %v, greedy's excess = %v, modest's = %v; want true, false, true", last, excess, other)
+	}
+
+	relay.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for !relay.slots.acquire("greedy") {
+		if time.Now().After(deadline) {
+			t.Fatal("closing greedy's session never released its slot")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

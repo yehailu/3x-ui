@@ -125,7 +125,7 @@ export default function AttachExistingClientsModal({
           group ? (
             <Tag color="geekblue">{group}</Tag>
           ) : (
-            <span style={{ color: 'rgba(0,0,0,0.45)' }}>—</span>
+            <Typography.Text type="secondary">—</Typography.Text>
           ),
       },
       {
@@ -200,7 +200,7 @@ export default function AttachExistingClientsModal({
       {noClients ? (
         <Alert type="info" showIcon title={t('pages.inbounds.attachExistingNoClients')} />
       ) : (
-        <Spin spinning={loading}>
+        <Spin aria-live="off" spinning={loading}>
           <Space orientation="vertical" size="small" style={{ width: '100%' }}>
             <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
               <Space wrap>

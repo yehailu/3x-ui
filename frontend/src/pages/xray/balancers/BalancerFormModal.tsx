@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Alert, Button, Form, Input, InputNumber, Modal, Select, Space, Switch, Tag } from 'antd';
@@ -6,6 +6,7 @@ import { MinusOutlined, PlusOutlined } from '@ant-design/icons';
 import { Controller, FormProvider, useForm, useWatch } from 'react-hook-form';
 import type { Path } from 'react-hook-form';
 
+import { selectTagRender } from '@/components/form';
 import { InputAddon } from '@/components/ui';
 import { FormField } from '@/components/form/rhf';
 import type { XraySettingsValue } from '@/hooks/useXraySetting';
@@ -68,6 +69,7 @@ export default function BalancerFormModal({
   onConfirm,
 }: BalancerFormModalProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const methods = useForm<BalancerFormValues>({ defaultValues: initialState(balancer) });
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const isEdit = balancer != null;
@@ -226,6 +228,7 @@ export default function BalancerFormModal({
               return (
                 <Form.Item
                   label={t('pages.xray.balancer.tag')}
+                  htmlFor={`${uid}-tag`}
                   required
                   validateStatus={errorMessage ? 'error' : showDuplicate ? 'warning' : ''}
                   help={
@@ -234,6 +237,7 @@ export default function BalancerFormModal({
                   hasFeedback
                 >
                   <Input
+                    id={`${uid}-tag`}
                     value={field.value}
                     onChange={(e) => field.onChange(e.target.value)}
                     onBlur={field.onBlur}
@@ -250,6 +254,7 @@ export default function BalancerFormModal({
           <FormField name="selector" label={t('pages.xray.balancer.selector')} required>
             <Select
               mode="tags"
+              tagRender={selectTagRender}
               tokenSeparators={[',']}
               options={outboundTags.map((tg) => ({ value: tg, label: tg }))}
             />
@@ -319,7 +324,7 @@ export default function BalancerFormModal({
                 <Button
                   size="small"
                   type="primary"
-                  icon={<PlusOutlined />}
+                  icon={<PlusOutlined aria-hidden />}
                   aria-label={t('add')}
                   onClick={() => methods.setValue('settings.baselines', [...baselines, ''])}
                 />
@@ -345,7 +350,7 @@ export default function BalancerFormModal({
                         )
                       }
                     >
-                      <MinusOutlined />
+                      <MinusOutlined aria-hidden />
                     </InputAddon>
                   </Space.Compact>
                 ))}
@@ -354,7 +359,7 @@ export default function BalancerFormModal({
                 <Button
                   size="small"
                   type="primary"
-                  icon={<PlusOutlined />}
+                  icon={<PlusOutlined aria-hidden />}
                   aria-label={t('add')}
                   onClick={() =>
                     methods.setValue('settings.costs', [
@@ -411,7 +416,7 @@ export default function BalancerFormModal({
                         )
                       }
                     >
-                      <MinusOutlined />
+                      <MinusOutlined aria-hidden />
                     </InputAddon>
                   </Space.Compact>
                 ))}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -26,12 +27,12 @@ func TestInboundCanEnableTlsFlow(t *testing.T) {
 		{"vmess tcp tls", string(model.VMESS), `{"network":"tcp","security":"tls"}`, "", false},
 		{"empty stream", string(model.VLESS), "", "", false},
 
-		// vlessenc is gated to XHTTP only. TCP without tls/reality is NOT
-		// Vision-capable even with vlessenc set — the combination only works on
-		// XHTTP in practice.
-		{"vless tcp vlessenc not capable", string(model.VLESS), `{"network":"tcp","security":"none"}`, `{"decryption":"mlkem768x25519plus.native.600s.mMFxPe7lz5xoq2qBk22cQYefu5fpc_2dGR8lMOKem0E","encryption":"mlkem768x25519plus.native.0rtt.hT4AY_tPWY9NVuKR3BIXxXq6zx9DqN2X86QPYW09XEM"}`, false},
-		// ws is a framed transport — vlessenc never enables Vision there.
-		{"vless ws vlessenc still off", string(model.VLESS), `{"network":"ws","security":"none"}`, `{"encryption":"` + vlessEncValue + `"}`, false},
+		// xray-core runs Vision inside VLESS encryption on any transport (encryption.CommonConn)
+		// but XDRIVE, which refuses a flow since 26.10.17 (#7182).
+		{"vless raw vlessenc", string(model.VLESS), `{"network":"tcp","security":"none"}`, `{"decryption":"mlkem768x25519plus.native.600s.mMFxPe7lz5xoq2qBk22cQYefu5fpc_2dGR8lMOKem0E","encryption":"mlkem768x25519plus.native.0rtt.hT4AY_tPWY9NVuKR3BIXxXq6zx9DqN2X86QPYW09XEM"}`, true},
+		{"vless ws vlessenc", string(model.VLESS), `{"network":"ws","security":"none"}`, `{"encryption":"` + vlessEncValue + `"}`, true},
+		{"vless xdrive vlessenc", string(model.VLESS), `{"network":"xdrive","security":"none"}`, `{"decryption":"` + vlessEncValue + `"}`, false},
+		{"vless xdrive no encryption", string(model.VLESS), `{"network":"xdrive","security":"none"}`, `{"decryption":"none"}`, false},
 
 		// XHTTP + VLESS encryption (the #5157 case).
 		{"vless xhttp vlessenc", string(model.VLESS), `{"network":"xhttp","security":"none"}`, `{"encryption":"` + vlessEncValue + `"}`, true},
@@ -89,20 +90,29 @@ func TestInboundCanHostFallbacks_StaysTcpOnly(t *testing.T) {
 	}
 }
 
-// Mirrors NODE_ELIGIBLE_PROTOCOLS in
-// frontend/src/pages/inbounds/form/InboundFormModal.tsx -- keep both lists
-// in sync if a protocol's node-eligibility ever changes.
-func TestIsNodeEligibleProtocol(t *testing.T) {
-	eligible := []model.Protocol{model.VLESS, model.VMESS, model.Trojan, model.Shadowsocks, model.Hysteria, model.WireGuard}
-	for _, p := range eligible {
-		if !isNodeEligibleProtocol(p) {
-			t.Errorf("isNodeEligibleProtocol(%q) = false, want true", p)
-		}
+// xray-core 26.10.31 (#7288) refuses an unknown autoSystemWfpBlockLeak value when the core starts.
+func TestAddInboundRefusesTunWfpBlockLeakTheCoreRefuses(t *testing.T) {
+	tests := []struct{ name, leaks, want string }{
+		{"port zero", `["tcp/0"]`, "unknown autoSystemWfpBlockLeak value: tcp/0"},
+		{"unknown protocol", `["icmp/1"]`, "unknown autoSystemWfpBlockLeak value: icmp/1"},
+		{"named values and ports", `["DNS","windnsclient","misconfigtun","udp/853","tcp/7215"]`, ""},
 	}
-	ineligible := []model.Protocol{model.MTProto, model.AmneziaWG, model.Mixed, model.HTTP, model.Tunnel}
-	for _, p := range ineligible {
-		if isNodeEligibleProtocol(p) {
-			t.Errorf("isNodeEligibleProtocol(%q) = true, want false", p)
-		}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setupBulkDB(t)
+			_, _, err := (&InboundService{}).AddInbound(&model.Inbound{
+				Enable: true, Port: 18520 + i, Protocol: model.Protocol("tun"),
+				Settings: `{"name":"xray0","autoSystemWfpBlockLeak":` + tc.leaks + `}`,
+			})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("AddInbound = %v, want values the core accepts saved", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("AddInbound = %v, want one containing %q", err, tc.want)
+			}
+		})
 	}
 }

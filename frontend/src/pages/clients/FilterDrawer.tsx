@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useId, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Button,
@@ -17,6 +17,7 @@ import {
 import dayjs from 'dayjs';
 import type { Dayjs } from 'dayjs';
 
+import { selectTagRender } from '@/components/form';
 import type { InboundOption } from '@/hooks/useClients';
 import type { NodeRecord } from '@/schemas/node';
 import { formatInboundLabel } from '@/lib/inbounds/label';
@@ -46,6 +47,7 @@ export default function FilterDrawer({
   nodes,
 }: FilterDrawerProps) {
   const { t } = useTranslation();
+  const uid = useId();
 
   function patch<K extends keyof ClientFilters>(key: K, value: ClientFilters[K]) {
     onChange({ ...filters, [key]: value });
@@ -113,26 +115,28 @@ export default function FilterDrawer({
           </Checkbox.Group>
         </Form.Item>
 
-        <Form.Item label={t('pages.inbounds.protocol')}>
+        <Form.Item label={t('pages.inbounds.protocol')} htmlFor={`${uid}-protocols`}>
           <Select
+            id={`${uid}-protocols`}
             mode="multiple"
+            tagRender={selectTagRender}
             value={filters.protocols}
             onChange={(v) => patch('protocols', v as string[])}
             options={protocolOptions}
             placeholder={t('pages.inbounds.protocol')}
-            maxTagCount="responsive"
             allowClear
           />
         </Form.Item>
 
-        <Form.Item label={t('inbounds')}>
+        <Form.Item label={t('pages.clients.attachedInbounds')} htmlFor={`${uid}-inbounds`}>
           <Select
+            id={`${uid}-inbounds`}
             mode="multiple"
+            tagRender={selectTagRender}
             value={filters.inboundIds}
             onChange={(v) => patch('inboundIds', v as number[])}
             options={inboundOptions}
-            placeholder={t('inbounds')}
-            maxTagCount="responsive"
+            placeholder={t('pages.clients.attachedInbounds')}
             allowClear
             showSearch={{ optionFilterProp: 'label' }}
             listHeight={220}
@@ -140,14 +144,15 @@ export default function FilterDrawer({
         </Form.Item>
 
         {nodes.length > 0 && (
-          <Form.Item label={t('pages.clients.filters.nodes')}>
+          <Form.Item label={t('pages.clients.filters.nodes')} htmlFor={`${uid}-nodes`}>
             <Select
+              id={`${uid}-nodes`}
               mode="multiple"
+              tagRender={selectTagRender}
               value={filters.nodeIds}
               onChange={(v) => patch('nodeIds', v as number[])}
               options={nodeOptions}
               placeholder={t('pages.clients.filters.nodes')}
-              maxTagCount="responsive"
               allowClear
               showSearch={{ optionFilterProp: 'label' }}
               listHeight={220}
@@ -155,22 +160,24 @@ export default function FilterDrawer({
           </Form.Item>
         )}
 
-        <Form.Item label={t('pages.clients.group')}>
+        <Form.Item label={t('pages.clients.group')} htmlFor={`${uid}-groups`}>
           <Select
+            id={`${uid}-groups`}
             mode="multiple"
+            tagRender={selectTagRender}
             value={filters.groups}
             onChange={(v) => patch('groups', v as string[])}
             options={groupOptions}
             placeholder={t('pages.clients.groupPlaceholder')}
-            maxTagCount="responsive"
             allowClear
             showSearch={{ optionFilterProp: 'label' }}
             listHeight={220}
           />
         </Form.Item>
 
-        <Form.Item label={t('pages.clients.expiryTime')}>
+        <Form.Item label={t('pages.clients.expiryTime')} htmlFor={`${uid}-expiry`}>
           <DatePicker.RangePicker
+            id={`${uid}-expiry`}
             value={dateRange}
             onChange={(range) => {
               const from = range?.[0]?.startOf('day').valueOf();
@@ -182,10 +189,11 @@ export default function FilterDrawer({
           />
         </Form.Item>
 
-        <Form.Item label={`${t('pages.clients.traffic')} (GB)`}>
+        <Form.Item label={`${t('pages.clients.traffic')} (GB)`} htmlFor={`${uid}-usage-from`}>
           <Row gutter={8}>
             <Col span={12}>
               <InputNumber
+                id={`${uid}-usage-from`}
                 value={filters.usageFromGB}
                 min={0}
                 step={1}
@@ -196,6 +204,7 @@ export default function FilterDrawer({
             </Col>
             <Col span={12}>
               <InputNumber
+                aria-label={`${t('pages.clients.traffic')} (GB) ${t('to')}`}
                 value={filters.usageToGB}
                 min={0}
                 step={1}

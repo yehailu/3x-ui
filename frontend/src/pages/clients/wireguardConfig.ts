@@ -1,4 +1,6 @@
+import type { HostEndpoint } from '@/lib/hosts/host-link';
 import { formatInboundLabel } from '@/lib/inbounds/label';
+import { joinConfLines } from '@/lib/xray/conf-lines';
 import { preferPublicHost, resolveShareHost } from '@/lib/xray/inbound-link';
 import type { ClientRecord, InboundOption } from '@/hooks/useClients';
 
@@ -9,7 +11,7 @@ export function isWireguardClient(client: ClientRecord | null | undefined): bool
     client.publicKey ||
     client.allowedIPs ||
     client.preSharedKey ||
-    client.keepAlive
+    typeof client.keepAlive === 'number'
   );
 }
 
@@ -28,16 +30,17 @@ export function buildWireguardClientConfig(
   host = window.location.hostname,
   publicHost = '',
   addressOverride = '',
+  hostEndpoint?: HostEndpoint,
 ): string {
-  const endpointHost = resolveShareHost(
-    inbound ?? {},
-    inbound?.nodeAddress ?? '',
-    preferPublicHost(host, publicHost),
-  );
+  const endpointHost =
+    hostEndpoint?.dest ||
+    resolveShareHost(inbound ?? {}, inbound?.nodeAddress ?? '', preferPublicHost(host, publicHost));
   const address = addressOverride || client.allowedIPs || '10.0.0.2/32';
-  const endpoint = `${endpointHost}:${inbound?.port || ''}`;
+  const endpoint = `${endpointHost}:${hostEndpoint?.port || inbound?.port || ''}`;
   const inboundName = inbound ? formatInboundLabel(inbound.tag, inbound.remark) : '';
-  const remark = [inboundName, client.email, client.comment].filter(Boolean).join(' - ');
+  const remark = [inboundName, hostEndpoint?.remark, client.email, client.comment]
+    .filter(Boolean)
+    .join(' - ');
   const lines = [
     '[Interface]',
     `PrivateKey = ${client.privateKey || client.password || ''}`,
@@ -50,7 +53,7 @@ export function buildWireguardClientConfig(
   lines.push('[Peer]', `PublicKey = ${inbound?.wgPublicKey || ''}`);
   if (client.preSharedKey) lines.push(`PresharedKey = ${client.preSharedKey}`);
   lines.push('AllowedIPs = 0.0.0.0/0, ::/0', `Endpoint = ${endpoint}`);
-  if (client.keepAlive && client.keepAlive > 0)
+  if (typeof client.keepAlive === 'number' && client.keepAlive > 0)
     lines.push(`PersistentKeepalive = ${client.keepAlive}`);
-  return lines.join('\n');
+  return joinConfLines(lines);
 }

@@ -1,3 +1,4 @@
+import { NativeSelect } from '@/components/form/NativeSelect';
 import { Button, Divider, Form, Input, Select } from 'antd';
 import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import { useTranslation } from 'react-i18next';
@@ -38,7 +39,7 @@ export default function CustomSockoptList({
             <Button
               type="dashed"
               size="small"
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               onClick={() => add({ type: 'int', level: '6', opt: '', value: '' })}
             >
               {t('pages.inbounds.form.addCustomOption')}
@@ -68,7 +69,7 @@ export default function CustomSockoptList({
                 <Input placeholder="decimal, e.g. 19" />
               </Form.Item>
               <Form.Item label="Type" name={[field.name, 'type']}>
-                <Select options={TYPE_OPTIONS} />
+                <NativeSelect options={TYPE_OPTIONS} />
               </Form.Item>
               <Form.Item label="Value" name={[field.name, 'value']}>
                 <Input placeholder="value" />

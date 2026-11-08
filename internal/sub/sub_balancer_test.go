@@ -2,11 +2,15 @@ package sub
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/json_util"
 )
 
 func seedSubBalancer(t *testing.T, b *model.SubBalancer) *model.SubBalancer {
@@ -57,7 +61,7 @@ func TestSubJson_BalancerDocument(t *testing.T) {
 	})
 
 	rules := `[{"type":"field","domain":["geosite:example"],"outboundTag":"proxy"}]`
-	js := NewSubJsonService("", rules, "", NewSubService(""))
+	js := NewSubJsonService("", rules, "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -155,7 +159,7 @@ func TestSubJson_BalancerOrderInterleavesWithInbounds(t *testing.T) {
 		Remark: "bal", Strategy: "roundRobin", InboundIds: []int{later.Id, first.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -189,7 +193,7 @@ func TestSubJson_BalancerDisabledAndEmptySkipped(t *testing.T) {
 		Remark: "nomembers", Strategy: "random", InboundIds: []int{inbound.Id + 100}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -213,7 +217,7 @@ func TestSubJson_BalancerTagDedup(t *testing.T) {
 		Remark: "dedup", Strategy: "leastPing", InboundIds: []int{a.Id, b.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -241,7 +245,7 @@ func TestSubJson_BalancerObservatoryConditional(t *testing.T) {
 		Remark: "pinger", Strategy: "leastPing", InboundIds: []int{lp.Id}, SortOrder: 2, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	js.SetObservatoryConfig(`{"destination":"https://probe.example/204","httpMethod":"GET","sampling":5}`)
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
@@ -287,7 +291,7 @@ func TestSubJson_BalancerExcludesDisabledInbound(t *testing.T) {
 		Remark: "bal", Strategy: "random", InboundIds: []int{a.Id, b.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -322,7 +326,7 @@ func TestSubJson_BalancerSkippedWhenAllMembersDisabled(t *testing.T) {
 		Remark: "empty", Strategy: "random", InboundIds: []int{only.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -345,7 +349,7 @@ func TestSubJson_BalancerObservatoryConnectivityDefaultEmpty(t *testing.T) {
 		Remark: "pinger", Strategy: "leastPing", InboundIds: []int{inb.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -386,7 +390,7 @@ func TestSubJson_BalancerObservatoryAlwaysEmittedForProbingStrategies(t *testing
 		Remark: "pinger", Strategy: "leastPing", InboundIds: []int{a.Id, b.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	js.SetObservatoryConfig(`{"enabled":false}`)
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
@@ -444,7 +448,7 @@ func TestSubJson_BalancerLeastLoadCosts(t *testing.T) {
 		MemberWeights: map[int]float64{fast.Id: 0.2}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -476,7 +480,7 @@ func TestSubJson_BalancerLeastLoadWithoutWeightsOmitsCosts(t *testing.T) {
 		Remark: "plain", Strategy: "leastLoad", InboundIds: []int{a.Id, b.Id}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -498,7 +502,7 @@ func TestSubJson_BalancerCostsSkippedForNonLeastLoadStrategy(t *testing.T) {
 		MemberWeights: map[int]float64{a.Id: 0.5}, SortOrder: 1, Enabled: true,
 	})
 
-	js := NewSubJsonService("", "", "", NewSubService(""))
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
 	out, _, err := js.GetJson("s1", "req.example.com", true)
 	if err != nil {
 		t.Fatalf("GetJson: %v", err)
@@ -506,5 +510,46 @@ func TestSubJson_BalancerCostsSkippedForNonLeastLoadStrategy(t *testing.T) {
 	strategy := balancerStrategy(t, parseSubJsonDocs(t, out), "misconfig")
 	if _, has := strategy["settings"]; has {
 		t.Fatalf("random balancer must never emit costs despite stored weights: %v", strategy)
+	}
+}
+
+// A node authors the endpoint list of its inbounds, so the member count is
+// not the admin's to bound; probing every taken suffix per member went quadratic.
+func TestSubJson_BalancerManySameProtocolMembers(t *testing.T) {
+	members := make([]map[string]any, 100_000)
+	for i := range members {
+		members[i] = map[string]any{"protocol": "vless", "tag": "proxy"}
+	}
+	// A protocol whose base collides with a suffixed tag must still be skipped.
+	members[0]["protocol"] = "vless-3"
+	members[4]["protocol"] = "trojan"
+
+	js := NewSubJsonService("", "", "", "", NewSubService(""))
+	done := make(chan json_util.RawMessage, 1)
+	go func() {
+		done <- js.buildBalancerConfig(
+			&model.SubBalancer{Id: 1, Remark: "many", Strategy: "random", InboundIds: []int{7}},
+			[]subConfigEntry{{id: 7}},
+			[][]map[string]any{members},
+		)
+	}()
+	var raw json_util.RawMessage
+	select {
+	case raw = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("retagging %d same-protocol members did not finish in 30s", len(members))
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("balancer doc is not JSON: %v", err)
+	}
+	tags := docOutboundTags(doc)
+	want := []string{"bal-1-vless-3", "bal-1-vless", "bal-1-vless-2", "bal-1-vless-4", "bal-1-trojan", "bal-1-vless-5"}
+	if len(tags) < len(members) || !slices.Equal(tags[:len(want)], want) {
+		t.Fatalf("first member tags = %v, want %v", tags[:min(len(tags), len(want))], want)
+	}
+	if got, last := tags[len(members)-1], fmt.Sprintf("bal-1-vless-%d", len(members)-1); got != last {
+		t.Fatalf("last member tag = %q, want %q", got, last)
 	}
 }

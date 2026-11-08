@@ -30,6 +30,7 @@ type remoteRoutingKind string
 
 const (
 	remoteRoutingHapp  remoteRoutingKind = "happ"
+	remoteRoutingJson  remoteRoutingKind = "jsonhapp"
 	remoteRoutingClash remoteRoutingKind = "clash"
 
 	remoteRoutingCacheTTL     = 10 * time.Minute
@@ -38,7 +39,18 @@ const (
 	remoteRoutingHappMaxBody  = 16 << 10 // 16 KiB; Happ emits the result in a response header
 	remoteRoutingHappMaxValue = 8 << 10  // normalized Routing header value
 	remoteRoutingClashMaxBody = 2 << 20  // 2 MiB
+
+	// What a document may marshal to, aliases copied out; the encoder re-indents a node's text
+	// once per enclosing level, hence the depth bound.
+	remoteRoutingClashMaxWritten = 4 << 20
+	remoteRoutingClashMaxDepth   = 16
 )
+
+// isHappPayloadKind reports whether the kind carries a happ-payload source:
+// same validation and size caps, but a separate persisted cache row.
+func isHappPayloadKind(kind remoteRoutingKind) bool {
+	return kind == remoteRoutingHapp || kind == remoteRoutingJson
+}
 
 var errRemoteRoutingUnavailable = errors.New("remote routing source is temporarily unavailable")
 
@@ -167,19 +179,22 @@ func (r *remoteRoutingResolver) resolveEntry(kind remoteRoutingKind, raw string)
 }
 
 // RefreshRemoteRoutingSources warms and refreshes configured remote sources
-// from the cron job. Concurrent resolver reads are safe; fetches coalesce.
-func RefreshRemoteRoutingSources(happ, clash string) {
-	for kind, raw := range map[remoteRoutingKind]string{
-		remoteRoutingHapp:  happ,
-		remoteRoutingClash: clash,
+// from the cron job; concurrent resolver reads are safe, fetches coalesce.
+func RefreshRemoteRoutingSources(happ, clash, jsonRouting string) {
+	for kind, raw := range map[remoteRoutingKind][]string{
+		remoteRoutingHapp:  {happ},
+		remoteRoutingJson:  {jsonRouting},
+		remoteRoutingClash: {clash},
 	} {
-		_, remote, parseErr := common.ParseRemoteRoutingURL(raw)
-		if parseErr != nil {
-			logger.Warningf("Remote %s routing source is invalid", kind)
-			continue
-		}
-		if remote {
-			_ = routingSourceResolver.refreshSource(kind, raw)
+		for _, source := range raw {
+			_, remote, parseErr := common.ParseRemoteRoutingURL(source)
+			if parseErr != nil {
+				logger.Warningf("Remote %s routing source is invalid", kind)
+				continue
+			}
+			if remote {
+				_ = routingSourceResolver.refreshSource(kind, source)
+			}
 		}
 	}
 }
@@ -286,7 +301,7 @@ func (r *remoteRoutingResolver) fetch(key remoteRoutingKey, previous remoteRouti
 		}
 		return previous, nil
 	}
-	if key.kind == remoteRoutingHapp && isRemoteHappRedirect(resp.StatusCode) {
+	if isHappPayloadKind(key.kind) && isRemoteHappRedirect(resp.StatusCode) {
 		location := strings.TrimSpace(resp.Header.Get("Location"))
 		content, locationErr := normalizeHappRouting([]byte(location))
 		if locationErr != nil {
@@ -321,7 +336,7 @@ func (r *remoteRoutingResolver) fetch(key remoteRoutingKey, previous remoteRouti
 	if err != nil {
 		return remoteRoutingCacheEntry{}, err
 	}
-	if key.kind == remoteRoutingHapp && len(content) > remoteRoutingHappMaxValue {
+	if isHappPayloadKind(key.kind) && len(content) > remoteRoutingHappMaxValue {
 		return remoteRoutingCacheEntry{}, errors.New("Happ routing header exceeds the size limit")
 	}
 	return remoteRoutingCacheEntry{
@@ -346,7 +361,7 @@ func isRemoteHappRedirect(status int) bool {
 
 func normalizeRemoteRoutingContent(kind remoteRoutingKind, body []byte) (string, map[string]any, error) {
 	switch kind {
-	case remoteRoutingHapp:
+	case remoteRoutingHapp, remoteRoutingJson:
 		content, err := normalizeHappRouting(body)
 		return content, nil, err
 	case remoteRoutingClash:
@@ -368,6 +383,9 @@ func normalizeHappRouting(body []byte) (string, error) {
 			return "", fmt.Errorf("invalid Happ routing JSON: %w", err)
 		}
 		return "happ://routing/onadd/" + base64.StdEncoding.EncodeToString(compact), nil
+	}
+	if text == "happ://routing/off" {
+		return text, nil
 	}
 	if strings.ContainsAny(text, "\r\n") {
 		return "", errors.New("Happ deeplink must be a single line")
@@ -435,9 +453,12 @@ func normalizeClashRouting(body []byte) (string, map[string]any, error) {
 	if len(document) == 0 {
 		return "", nil, errors.New("Clash routing response must be a YAML map")
 	}
+	if budget := remoteRoutingClashMaxWritten; !clashFitsWritten(document, 0, &budget) {
+		return "", nil, errors.New("Clash routing response is too large or too deeply nested once written out")
+	}
 	hasSupportedKey := false
 	for key := range document {
-		if remoteClashAllowedKey(key) {
+		if remoteClashKeyClasses[key] == remoteClashRouteGraph {
 			hasSupportedKey = true
 			break
 		}
@@ -452,10 +473,47 @@ func normalizeClashRouting(body []byte) (string, map[string]any, error) {
 		}},
 		"rules": []string{"MATCH,PROXY"},
 	}
-	if err := mergeRemoteClashRules(base, document); err != nil {
+	if err := mergeRemoteClashRules(base, document, false); err != nil {
 		return "", nil, fmt.Errorf("invalid remote Clash routing schema: %w", err)
 	}
 	return text, document, nil
+}
+
+// clashFitsWritten charges what the encoder writes for v: every string per line at its
+// indentation, every node its indentation. It stops as soon as the budget is spent.
+func clashFitsWritten(v any, depth int, budget *int) bool {
+	if depth > remoteRoutingClashMaxDepth {
+		return false
+	}
+	indent := 2*depth + 2
+	switch v := v.(type) {
+	case string:
+		*budget -= len(v) + (strings.Count(v, "\n")+1)*indent
+	case []byte:
+		// The encoder writes !!binary values as a list with one item per byte.
+		*budget -= len(v) * (indent + 6)
+	case map[string]any:
+		for key, child := range v {
+			if *budget -= len(key) + indent; *budget < 0 || !clashFitsWritten(child, depth+1, budget) {
+				return false
+			}
+		}
+	case map[any]any:
+		for key, child := range v {
+			if *budget -= indent; *budget < 0 || !clashFitsWritten(key, depth+1, budget) || !clashFitsWritten(child, depth+1, budget) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if *budget -= indent; *budget < 0 || !clashFitsWritten(child, depth+1, budget) {
+				return false
+			}
+		}
+	default:
+		*budget -= indent + 24
+	}
+	return *budget >= 0
 }
 
 func resolveIncyRoutingSource(raw string) (string, bool, error) {
@@ -473,7 +531,9 @@ func newRemoteRoutingHTTPClient() *http.Client {
 		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   4 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		// Downloads are minutes apart, and a parked connection lives as long as the host likes.
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	return &http.Client{
 		Timeout:       remoteRoutingHTTPTimeout,
@@ -570,7 +630,7 @@ func (r *remoteRoutingResolver) triggerPersistedLoad() {
 
 func (r *remoteRoutingResolver) loadPersisted() {
 	loaded := make(map[remoteRoutingKey]remoteRoutingCacheEntry, 2)
-	for _, kind := range []remoteRoutingKind{remoteRoutingHapp, remoteRoutingClash} {
+	for _, kind := range []remoteRoutingKind{remoteRoutingHapp, remoteRoutingJson, remoteRoutingClash} {
 		var setting model.Setting
 		err := database.GetDB().Where("key = ?", remoteRoutingSettingKey(kind)).First(&setting).Error
 		if err != nil {
@@ -587,7 +647,7 @@ func (r *remoteRoutingResolver) loadPersisted() {
 		if err != nil {
 			continue
 		}
-		if kind == remoteRoutingHapp && len(normalized) > remoteRoutingHappMaxValue {
+		if isHappPayloadKind(kind) && len(normalized) > remoteRoutingHappMaxValue {
 			continue
 		}
 		entry.Content = normalized

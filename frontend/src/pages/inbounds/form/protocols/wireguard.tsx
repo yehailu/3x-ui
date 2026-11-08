@@ -1,5 +1,6 @@
+import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Form, Input, InputNumber, Select, Space, Switch } from 'antd';
+import { Button, Form, Input, InputNumber, Space, Switch } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 
 import { FormField } from '@/components/form/rhf';
@@ -11,18 +12,23 @@ interface WireguardFieldsProps {
 
 export default function WireguardFields({ wgPubKey, regenInboundWg }: WireguardFieldsProps) {
   const { t } = useTranslation();
+  const uid = useId();
   return (
     <>
-      <Form.Item label={t('pages.xray.wireguard.secretKey')}>
+      <Form.Item htmlFor={`${uid}-secretKey`} label={t('pages.xray.wireguard.secretKey')}>
         <Space.Compact block>
           <FormField name={['settings', 'secretKey']} noStyle>
-            <Input style={{ width: 'calc(100% - 32px)' }} />
+            <Input id={`${uid}-secretKey`} style={{ width: 'calc(100% - 32px)' }} />
           </FormField>
-          <Button aria-label={t('regenerate')} icon={<ReloadOutlined />} onClick={regenInboundWg} />
+          <Button
+            aria-label={t('regenerate')}
+            icon={<ReloadOutlined aria-hidden />}
+            onClick={regenInboundWg}
+          />
         </Space.Compact>
       </Form.Item>
-      <Form.Item label={t('pages.xray.wireguard.publicKey')}>
-        <Input value={wgPubKey} disabled />
+      <Form.Item htmlFor={`${uid}-publicKey`} label={t('pages.xray.wireguard.publicKey')}>
+        <Input id={`${uid}-publicKey`} value={wgPubKey} disabled />
       </Form.Item>
       <FormField name={['settings', 'subnetIp']} label={t('pages.xray.wireguard.subnetIp')}>
         <Input placeholder="10.0.0.0" />
@@ -42,21 +48,6 @@ export default function WireguardFields({ wgPubKey, regenInboundWg }: WireguardF
         valueProp="checked"
       >
         <Switch />
-      </FormField>
-      <FormField
-        name={['settings', 'domainStrategy']}
-        label={t('pages.xray.wireguard.domainStrategy')}
-      >
-        <Select
-          allowClear
-          options={[
-            { value: 'ForceIP', label: 'ForceIP' },
-            { value: 'ForceIPv4', label: 'ForceIPv4' },
-            { value: 'ForceIPv4v6', label: 'ForceIPv4v6' },
-            { value: 'ForceIPv6', label: 'ForceIPv6' },
-            { value: 'ForceIPv6v4', label: 'ForceIPv6v4' },
-          ]}
-        />
       </FormField>
     </>
   );
